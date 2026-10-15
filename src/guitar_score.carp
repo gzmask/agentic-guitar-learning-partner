@@ -1,0 +1,152 @@
+(Project.config "title" "guitar-score")
+
+; A short-lived Carp compiler target. It prints a Csound score and exits.
+; No Carp or Csound REPL remains alive between commands.
+
+(defn parse-int [text]
+  (match (Int.from-string text)
+    (Maybe.Just value) value
+    (Maybe.Nothing) 0))
+
+(defn parse-double [text]
+  (match (Double.from-string text)
+    (Maybe.Just value) value
+    (Maybe.Nothing) 0.0))
+
+(defn pitch-class [note]
+  (cond
+    (= note "c") 0
+    (or (= note "c#") (= note "db")) 1
+    (= note "d") 2
+    (or (= note "d#") (= note "eb")) 3
+    (= note "e") 4
+    (= note "f") 5
+    (or (= note "f#") (= note "gb")) 6
+    (= note "g") 7
+    (or (= note "g#") (= note "ab")) 8
+    (= note "a") 9
+    (or (= note "a#") (= note "bb")) 10
+    (= note "b") 11
+    0))
+
+(defn midi-hz [midi]
+  (* 440.0 (Double.pow 2.0 (/ (Double.from-int (- midi 69)) 12.0))))
+
+(defn root-midi [root octave]
+  (+ (* (+ octave 1) 12) (pitch-class root)))
+
+(defn chord-intervals [quality]
+  (cond
+    (= quality "minor") [0 3 7 12 15]
+    (= quality "major") [0 4 7 12 16]
+    (= quality "power") [0 7 12 19 24]
+    (= quality "minor7") [0 3 7 10 12]
+    (= quality "major7") [0 4 7 11 12]
+    (= quality "dominant7") [0 4 7 10 12]
+    (= quality "sus2") [0 2 7 12 14]
+    (= quality "sus4") [0 5 7 12 17]
+    [0 3 7 12 15]))
+
+(defn mode-intervals [mode]
+  (cond
+    (or (= mode "ionian") (= mode "major")) [0 4 7 11 12]
+    (= mode "dorian") [0 3 7 9 12]
+    (= mode "phrygian") [0 1 3 7 12]
+    (= mode "lydian") [0 4 6 7 12]
+    (= mode "mixolydian") [0 4 7 10 12]
+    (or (= mode "aeolian") (= mode "minor")) [0 3 7 8 12]
+    (= mode "locrian") [0 1 3 6 12]
+    [0 3 7 8 12]))
+
+(defn voicing-line [instrument root octave intervals bpm duration amplitude]
+  (let [base (root-midi root octave)
+        line (if (= instrument 1)
+               (str* "i 1 0 -1 " bpm " " duration " " amplitude)
+               (str* "i 3 0 -1 " amplitude))]
+    (do
+      (for [index 0 5]
+        (let [frequency (midi-hz (+ base @(Array.unsafe-nth &intervals index)))]
+          (set! line (str* &line " " frequency))))
+      ; Csound itself exits at exactly ten minutes, even if strings are active.
+      (str* &line "\ni 99 600 0.01\nf 0 z\n"))))
+
+; Four passes through the eight-bar opening of Fly Me to the Moon in C.
+; One chord per four-beat bar: Am7 Dm7 G7 Cmaj7 Fmaj7 Bm7b5 E7 Am7.
+(defn progression-root-midi [position]
+  (cond
+    (= position 0) 57  ; A3
+    (= position 1) 50  ; D3
+    (= position 2) 55  ; G3
+    (= position 3) 48  ; C3
+    (= position 4) 53  ; F3
+    (= position 5) 47  ; B2
+    (= position 6) 52  ; E3
+    57))               ; A3
+
+(defn progression-intervals [position]
+  (cond
+    (or (= position 0) (= position 1) (= position 7)) [0 3 7 10 12]
+    (or (= position 2) (= position 6)) [0 4 7 10 12]
+    (or (= position 3) (= position 4)) [0 4 7 11 12]
+    [0 3 6 10 12]))  ; Bm7b5
+
+(defn progression-chord-line [position start bar-seconds amplitude]
+  (let [base (progression-root-midi position)
+        intervals (progression-intervals position)
+        pattern [0 1 2 3 4 3 2 1]
+        note-step (/ bar-seconds 8.0)
+        note-length (* note-step 1.3)
+        line (String.copy "")]
+    (do
+      ; Eight eighth-notes: root, third, fifth, seventh, octave, and back.
+      (for [index 0 8]
+        (let [interval @(Array.unsafe-nth &intervals @(Array.unsafe-nth &pattern index))
+              note-line (str* "i 2 " (+ start (* (Double.from-int index) note-step))
+                              " " note-length " " (midi-hz (+ base interval))
+                              " " (/ amplitude 2.5)
+                              " " (- 0.2 (* 0.06 (Double.from-int index))) "\n")]
+          (set! line (String.append &line &note-line))))
+      line)))
+
+(defn progression-score [bpm amplitude]
+  (let [bar-seconds (/ 240.0 bpm)
+        end-seconds (* 32.0 bar-seconds)
+        score (String.copy "")]
+    (do
+      (for [step 0 32]
+        (let [bar-start (* (Double.from-int step) bar-seconds)
+              chord-line (progression-chord-line (mod step 8)
+                                                  bar-start
+                                                  bar-seconds
+                                                  amplitude)
+              kick-line (str* "i 5 " bar-start " 0.35 " (* amplitude 0.6) "\n")]
+          (do
+            (set! score (String.append &score &chord-line))
+            (set! score (String.append &score &kick-line)))))
+      (str* &score "i 99 " end-seconds " 0.01\nf 0 z\n"))))
+
+(defn main []
+  (if (/= (StaticArray.length &System.args) 8)
+    (IO.errorln "Usage: guitar-score <guitar|chord|mode|root> <root> <quality> <octave> <bpm> <envelope-seconds> <amplitude>")
+    (let [kind @(StaticArray.unsafe-nth &System.args 1)
+          root @(StaticArray.unsafe-nth &System.args 2)
+          quality @(StaticArray.unsafe-nth &System.args 3)
+          octave (parse-int (StaticArray.unsafe-nth &System.args 4))
+          bpm (parse-double (StaticArray.unsafe-nth &System.args 5))
+          duration (parse-double (StaticArray.unsafe-nth &System.args 6))
+          amplitude (parse-double (StaticArray.unsafe-nth &System.args 7))]
+      (cond
+        (= &kind "progression")
+        (IO.println &(progression-score bpm amplitude))
+        (= &kind "guitar")
+        (let [base (root-midi &root octave)
+              ; A minor uses A2 E3 A3 C4 E4, the usual five-string voicing.
+              intervals (if (= &quality "minor") [0 7 12 15 19] (chord-intervals &quality))]
+          (IO.println &(voicing-line 1 &root octave intervals bpm duration amplitude)))
+        (= &kind "chord")
+        (IO.println &(voicing-line 3 &root octave (chord-intervals &quality) bpm duration amplitude))
+        (= &kind "mode")
+        (IO.println &(voicing-line 3 &root octave (mode-intervals &quality) bpm duration amplitude))
+        (= &kind "root")
+        (IO.println &(voicing-line 3 &root octave [0 0 12 12 24] bpm duration amplitude))
+        (IO.errorln "Unknown practice kind")))))
