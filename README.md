@@ -1,6 +1,6 @@
-# Guitar Practice: Carp + Csound
+# Agentic Guitar Learning Partner
 
-A small guitar-practice instrument. **Carp** compiles the note/voicing logic into
+A Carp + Csound guitar-practice instrument. **Carp** compiles the note/voicing logic into
 `out/guitar-score`; **Csound** synthesizes the sound. There is no nREPL, JVM,
 long-lived scheduler, or stale synth state. **Every audio process is capped at
 10 minutes**, even if you forget to stop it. `bb stop` terminates the exact

@@ -1,4 +1,4 @@
-# Guitar practice controls (Carp + Csound)
+# Agentic Guitar Learning Partner — agent controls
 
 This project does **not** use a REPL. Read `README.md` before changing sounds.
 For user-directed audio: `bb play guitar a minor 2 64 2.0 0.18`, `bb play chord a
