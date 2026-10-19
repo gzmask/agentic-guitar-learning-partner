@@ -96,15 +96,23 @@
         pattern [0 1 2 3 4 3 2 1]
         note-step (/ bar-seconds 8.0)
         note-length (* note-step 1.3)
+        root-length (* bar-seconds 0.98)
         line (String.copy "")]
     (do
       ; Eight eighth-notes: root, third, fifth, seventh, octave, and back.
+      ; The bass root (index 0) rings the whole bar on the sustaining/vibrato
+      ; electric voice (instr 2); every other note is right-hand tapping
+      ; (instr 4), short and percussive.
       (for [index 0 8]
         (let [interval @(Array.unsafe-nth &intervals @(Array.unsafe-nth &pattern index))
-              note-line (str* "i 2 " (+ start (* (Double.from-int index) note-step))
-                              " " note-length " " (midi-hz (+ base interval))
-                              " " (/ amplitude 2.5)
-                              " " (- 0.2 (* 0.06 (Double.from-int index))) "\n")]
+              frequency (midi-hz (+ base interval))
+              at (+ start (* (Double.from-int index) note-step))
+              note-line (if (= index 0)
+                          (str* "i 2 " at " " root-length " " frequency
+                                " " (/ amplitude 2.2) " 0.0\n")
+                          (str* "i 4 " at " " note-length " " frequency
+                                " " (/ amplitude 2.5)
+                                " " (- 0.2 (* 0.06 (Double.from-int index))) "\n"))]
           (set! line (String.append &line &note-line))))
       line)))
 
@@ -115,11 +123,16 @@
     (do
       (for [step 0 32]
         (let [bar-start (* (Double.from-int step) bar-seconds)
+              eighth (/ bar-seconds 8.0)
               chord-line (progression-chord-line (mod step 8)
                                                   bar-start
                                                   bar-seconds
                                                   amplitude)
-              kick-line (str* "i 5 " bar-start " 0.35 " (* amplitude 0.6) "\n")]
+              ; Syncopation: keep the downbeat clear for the root. Push the
+              ; kick an eighth-note late (the "and" of beat 1), with a lighter
+              ; answer on the "and" of beat 3 for a floating latin feel.
+              kick-line (str* "i 5 " (+ bar-start eighth) " 0.35 " (* amplitude 0.6)
+                              "\ni 5 " (+ bar-start (* 5.0 eighth)) " 0.35 " (* amplitude 0.4) "\n")]
           (do
             (set! score (String.append &score &chord-line))
             (set! score (String.append &score &kick-line)))))

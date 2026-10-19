@@ -31,19 +31,30 @@ bb status
 bb stop                          # immediate, confirmed silence
 ```
 
+Use `bb play` to start audio; there is no `bb start` task. Run `bb tasks` to list
+available commands.
+
 Full argument order: `bb play KIND ROOT QUALITY OCTAVE BPM ENVELOPE AMP`.
 Arguments after `KIND` are optional. The tempo and envelope apply to `guitar`
 (the guitar strums every two beats). Pad sounds (`chord`, `mode`, `root`) sustain
 until stopped. `progression` plays **Am7 → Dm7 → G7 → Cmaj7 → Fmaj7 →
 Bm7♭5 → E7 → Am7**, one four-beat bar per chord for four loops. Each bar
-arpeggiates eighth notes (root–third–fifth–seventh–octave–seventh–fifth–third)
-with short, overlapping plucked-string envelopes and a kick on beat 1 of every
-bar. At the default 64 BPM, that
-is two minutes; its score ends automatically. Set a different BPM with
+arpeggiates eighth notes (root–third–fifth–seventh–octave–seventh–fifth–third).
+The root sustains for 98% of the bar with delayed vibrato; the remaining seven
+notes use a separate, percussive right-hand tapping voice without vibrato.
+Syncopated kicks land on the **and of beats 1 and 3**, with the second kick
+lighter, leaving the root's downbeat clear. At the default 64 BPM, that is two
+minutes; its score ends automatically. Set a different BPM with
 `bb play progression a minor 3 80`. The progression uses fixed practical chord
 voicings, so octave and envelope arguments do not affect it. Guitar has five plucked strings with a five-note voicing; Am is
 A2–E3–A3–C4–E4. The default amplitude is 0.18, with a maximum accepted value of
 0.5. Each new `play` stops the preceding sound before starting the next.
+
+The electric guitar voice combines a plucked attack with sustained fundamental
+and octave layers, soft overdrive, and a 2800 Hz low-pass filter. Vibrato on the
+sustained layers starts after 0.35 seconds, reaching full depth over the next
+0.25 seconds (5.5 Hz, ±1.5% pitch). Both `guitar` strums and progression roots
+use this voice; tapped notes have a shorter decay and no vibrato.
 
 Available chord qualities: `major`, `minor`, `power`, `minor7`, `major7`,
 `dominant7`, `sus2`, `sus4`. Modes: `ionian`/`major`, `dorian`, `phrygian`,

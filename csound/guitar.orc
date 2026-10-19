@@ -20,13 +20,43 @@ instr 1
   endif
 endin
 
-; Plucked string: deterministic, hard two-second (or configured) envelope.
+; score: i 2 start duration freq amplitude pan
+; Sustaining electric string with a plucked attack and delayed vibrato.
 instr 2
-  aenv linseg 0, 0.008, 1, max(0.01, p3 - 0.008), 0
+  ; electric guitar: fast attack, long sustain plateau, quick release
+  aenv linseg 0, 0.006, 1, 0.05, 0.85, max(0.01, p3 - 0.15), 0.8, 0.09, 0
   astr pluck p5, p4, p4, 0, 1
-  astr tone astr, 4800
-  aleft = astr * aenv * sqrt((1 - p6) / 2)
-  aright = astr * aenv * sqrt((1 + p6) / 2)
+  ; sustained tone layer (fundamental + octave) reinforces the string
+  ; delayed vibrato: depth ramps in ~0.35s after the note, ~5.5 Hz, +/-1.5%
+  kvibdepth linseg 0, 0.35, 0, 0.25, 1
+  kvib oscili kvibdepth * 0.015, 5.5
+  kvfreq = p4 * (1 + kvib)
+  asus1 oscili p5 * 0.5, kvfreq
+  asus2 oscili p5 * 0.22, kvfreq * 2
+  amix = astr + asus1 + asus2
+  ; soft overdrive: harmonics, compression and sustain (amp-driven)
+  idrive = 30
+  adrv = tanh(amix * idrive) * p5 * 1.2
+  ; tame the fizz without killing the bite
+  adrv tone adrv, 2800
+  aleft = adrv * aenv * sqrt((1 - p6) / 2)
+  aright = adrv * aenv * sqrt((1 + p6) / 2)
+  outs aleft, aright
+endin
+
+; score: i 4 start duration freq amplitude pan
+; Right-hand tapping voice: percussive attack, short decay, electric drive,
+; no vibrato and no long sustain plateau -- the melodic counterpart to the
+; ringing root on instr 2.
+instr 4
+  aenv linseg 0, 0.004, 1, 0.03, 0.5, max(0.01, p3 - 0.1), 0.18, 0.066, 0
+  astr pluck p5, p4, p4, 0, 1
+  abody oscili p5 * 0.3, p4
+  amix = astr + abody
+  adrv = tanh(amix * 24) * p5 * 1.1
+  adrv tone adrv, 3200
+  aleft = adrv * aenv * sqrt((1 - p6) / 2)
+  aright = adrv * aenv * sqrt((1 + p6) / 2)
   outs aleft, aright
 endin
 

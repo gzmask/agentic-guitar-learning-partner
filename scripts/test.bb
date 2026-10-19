@@ -15,18 +15,66 @@
       (throw (ex-info "Command failed" {:command command :error err})))
     out))
 
-(defn score [kind root-note quality octave]
-  (run-command! [executable kind root-note quality (str octave) "64" "2.0" "0.15"]))
+(defn score [kind root-note quality octave & [bpm]]
+  (run-command! [executable kind root-note quality (str octave) (str (or bpm 64)) "2.0" "0.15"]))
 
 (defn score-frequencies [score]
   (let [[_ instrument _ _ & fields] (str/split (first (str/split-lines score)) #" ")]
     (mapv #(Double/parseDouble %) (drop (if (= instrument "1") 3 1) fields))))
 
-(defn near? [expected actual]
-  (< (Math/abs (- expected actual)) 0.02))
+(defn near?
+  ([expected actual] (near? expected actual 0.02))
+  ([expected actual tolerance]
+   (< (Math/abs (- expected actual)) tolerance)))
 
 (defn assert! [condition message]
   (when-not condition (throw (ex-info message {}))))
+
+(defn instrument-events [generated-score instrument]
+  (->> (str/split-lines generated-score)
+       (filter #(str/starts-with? % (str "i " instrument " ")))
+       (mapv (fn [line]
+               (mapv #(Double/parseDouble %) (drop 2 (str/split line #" +")))))))
+
+(defn assert-progression! [generated-score bpm]
+  (let [roots (instrument-events generated-score 2)
+        taps (instrument-events generated-score 4)
+        kicks (instrument-events generated-score 5)
+        eighth (/ 30.0 bpm)
+        bar-seconds (* eighth 8)
+        root-frequencies [220.0 146.832 195.998 130.813 174.614 123.471 164.814 220.0]
+        end-seconds (Double/parseDouble
+                     (second (re-find #"(?m)^i 99 ([0-9.]+) 0\.01$" generated-score)))]
+    (assert! (= 32 (count roots)) "Expected one sustained root per bar across four loops")
+    (assert! (= 224 (count taps)) "Expected seven tapping notes per bar across four loops")
+    (assert! (= 64 (count kicks)) "Expected two syncopated kicks per bar across four loops")
+    (doseq [[index [start duration frequency amplitude pan]] (map-indexed vector roots)]
+      (assert! (near? (* index bar-seconds) start) "Root must anchor the downbeat")
+      (assert! (near? (* bar-seconds 0.98) duration) "Root must sustain for 98% of the bar")
+      (assert! (near? (nth root-frequencies (mod index 8)) frequency) "Incorrect progression root")
+      (assert! (near? (/ 0.15 2.2) amplitude 1.0e-6) "Incorrect sustained-root amplitude")
+      (assert! (near? 0.0 pan) "Sustained root must be centered"))
+    (doseq [[index [start duration _ amplitude pan]] (map-indexed vector taps)]
+      (let [bar (quot index 7)
+            subdivision (inc (mod index 7))]
+        (assert! (near? (+ (* bar bar-seconds) (* subdivision eighth)) start)
+                 "Tapping notes must occupy the remaining seven eighth-note subdivisions")
+        (assert! (near? (* eighth 1.3) duration) "Incorrect tapping duration")
+        (assert! (near? (/ 0.15 2.5) amplitude 1.0e-6) "Incorrect tapping amplitude")
+        (assert! (near? (- 0.2 (* 0.06 subdivision)) pan) "Incorrect tapping pan")))
+    (assert! (near? 261.626 (nth (first taps) 2)) "The first tap must be C4, the third of Am7")
+    (doseq [[index [start duration amplitude]] (map-indexed vector kicks)]
+      (let [bar (quot index 2)
+            primary? (even? index)
+            subdivision (if primary? 1 5)]
+        (assert! (near? (+ (* bar bar-seconds) (* subdivision eighth)) start)
+                 "Kicks must land on the and of beats 1 and 3, not the root downbeat")
+        (assert! (near? 0.35 duration) "Incorrect kick duration")
+        (assert! (near? (* 0.15 (if primary? 0.6 0.4)) amplitude 1.0e-6)
+                 "The answering kick must be lighter than the first")))
+    (assert! (near? (* 32 bar-seconds) end-seconds) "Progression must end after four loops")
+    (assert! (every? #(< (first %) end-seconds) (concat roots taps kicks))
+             "No note may start at or after the score's hard stop")))
 
 (defn -main []
   (run-command! ["carp" "-b" "src/guitar_score.carp"])
@@ -35,7 +83,7 @@
         chord (score "chord" "a" "minor" 3)
         root-score (score "root" "a" "minor" 2)
         progression (score "progression" "a" "minor" 3)
-        arpeggio-notes (filter #(str/starts-with? % "i 2 ")
+        arpeggio-notes (filter #(re-find #"^i (?:2|4) " %)
                                (str/split-lines progression))
         kick-notes (filter #(str/starts-with? % "i 5 ")
                            (str/split-lines progression))
@@ -50,24 +98,9 @@
     (assert! (near? 261.626 (second (score-frequencies chord))) "Am chord lacks C4")
     (assert! (near? 110.0 (first (score-frequencies root-score))) "A2 root is out of tune")
     (assert! (str/includes? guitar "i 1 0 -1 64 2 0.15") "Wrong tempo or envelope")
-    (assert! (= 256 (count arpeggio-notes)) "Expected 4 loops × 8 chords × 8 notes")
-    (assert! (= 32 (count kick-notes)) "Expected one kick per bar across four loops")
-    (assert! (near? 0.0 (Double/parseDouble (nth (str/split (first kick-notes) #" ") 2)))
-             "First kick must coincide with the first bar")
-    (assert! (near? 3.75 (Double/parseDouble (nth (str/split (second kick-notes) #" ") 2)))
-             "Kicks must land every four beats at 64 BPM")
-    (assert! (near? 116.25 (Double/parseDouble (nth (str/split (last kick-notes) #" ") 2)))
-             "Last kick must land on the final bar, not after it")
-    (assert! (str/includes? progression "i 99 120 0.01")
-             "Progression must end after 120 seconds at 64 BPM")
-    (assert! (near? 220.0 (Double/parseDouble (nth (str/split (first arpeggio-notes) #" ") 4)))
-             "Arpeggio must begin on Am7 at A3")
-    (assert! (near? 261.626 (Double/parseDouble (nth (str/split (second arpeggio-notes) #" ") 4)))
-             "The second note should be the third (C4) of Am7")
-    (assert! (near? 0.46875 (Double/parseDouble (nth (str/split (second arpeggio-notes) #" ") 2)))
-             "Notes should fall on eighth-note subdivisions at 64 BPM")
-    (assert! (near? 123.471 (Double/parseDouble (nth (str/split (nth arpeggio-notes 40) #" ") 4)))
-             "The sixth chord must be Bm7b5 at B2")
+    (assert-progression! progression 64)
+    (doseq [bpm [20 240]]
+      (assert-progression! (score "progression" "a" "minor" 3 bpm) bpm))
     (doseq [generated-score [guitar dorian chord root-score]]
       (assert! (str/includes? generated-score "i 99 600 0.01")
                "Missing Csound ten-minute hard stop"))
@@ -80,7 +113,7 @@
       (assert! (<= 2.49 rendered-seconds 2.55)
                (str "Csound did not stop at the 2.5-second test cap: " rendered-seconds)))
     (spit progression-sample (str (str/join "\n" (concat (take 16 arpeggio-notes)
-                                                        (take 2 kick-notes)))
+                                                        (take 4 kick-notes)))
                                   "\ni 99 6 0.01\nf 0 z\n"))
     (run-command! ["csound" "-d" "-m0" "-W" "-o" progression-wav orchestra progression-sample])
     (let [rendered-seconds (/ (fs/size progression-wav) 192000.0)]
@@ -94,6 +127,6 @@
           elapsed (/ (- (System/nanoTime) started) 1.0e9)]
       (assert! (and (not (zero? exit)) (<= 0.9 elapsed 3.0))
                (str "OS wall-clock alarm did not terminate its child in 1s: " elapsed)))
-    (println "Carp and Csound hard-stop tests passed; no live audio is running.")))
+    (println "Carp arrangement and Csound hard-stop tests passed; no live audio was started.")))
 
 (-main)
