@@ -20,11 +20,15 @@ instr 1
   endif
 endin
 
-; score: i 2 start duration freq amplitude pan
-; Sustaining electric string with a plucked attack and delayed vibrato.
-instr 2
-  ; electric guitar: fast attack, long sustain plateau, quick release
-  aenv linseg 0, 0.006, 1, 0.05, 0.85, max(0.01, p3 - 0.15), 0.8, 0.09, 0
+; score: i 2 (root/strum) or i 6 (lead) start duration freq amplitude pan
+; Roots and lead share the selected electric tone, but remain separate tracks.
+instr 2, 6
+  ; Fit attack/release inside short lead notes, even at 240 BPM.
+  iattack = min(0.006, p3 * 0.1)
+  idecay = min(0.05, p3 * 0.15)
+  irelease = min(0.09, p3 * 0.25)
+  iplateau = p3 - iattack - idecay - irelease
+  aenv linseg 0, iattack, 1, idecay, 0.85, iplateau, 0.8, irelease, 0
   astr pluck p5, p4, p4, 0, 1
   ; sustained tone layer (fundamental + octave) reinforces the string
   ; delayed vibrato: depth ramps in ~0.35s after the note, ~5.5 Hz, +/-1.5%
@@ -60,7 +64,28 @@ instr 4
   outs aleft, aright
 endin
 
-; A restrained kick: one low-frequency sweep on beat 1 of each bar.
+; score: i 7 start 0.001 bar beat root-midi third fifth seventh
+; Silent text cue, initialized on the same score clock as the chord change.
+; Numeric p-fields avoid version-dependent score string handling.
+; Live output goes to the owned Csound log; offline renders stay independent.
+instr 7
+  Sroots[] fillarray "C", "Db", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B"
+  iroot = int(p6) % 12
+  Squality = "?"
+  if (p7 == 3 && p8 == 6 && p9 == 10) then
+    Squality = "m7b5"
+  elseif (p7 == 3 && p8 == 7 && p9 == 10) then
+    Squality = "m7"
+  elseif (p7 == 4 && p8 == 7 && p9 == 11) then
+    Squality = "maj7"
+  elseif (p7 == 4 && p8 == 7 && p9 == 10) then
+    Squality = "7"
+  endif
+  Slabel strcat Sroots[iroot], Squality
+  printf_i "CHORD bar=%02d/32 beat=%d name=%s\n", 1, p4, p5, Slabel
+endin
+
+; A restrained kick: low-frequency sweeps on the and of beats 1 and 3.
 ; score: i 5 start 0.35 amplitude
 instr 5
   aenv expseg 1, 0.35, 0.0001
