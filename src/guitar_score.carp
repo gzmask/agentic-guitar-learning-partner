@@ -1,4 +1,5 @@
 (Project.config "title" "guitar-score")
+(load "src/fly_me.carp")
 
 ; A short-lived Carp compiler target. It prints a Csound score and exits.
 ; No Carp or Csound REPL remains alive between commands.
@@ -70,77 +71,80 @@
       ; Csound itself exits at exactly ten minutes, even if strings are active.
       (str* &line "\ni 99 600 0.01\nf 0 z\n"))))
 
-; Four passes through the eight-bar opening of Fly Me to the Moon in C.
-; One chord per four-beat bar: Am7 Dm7 G7 Cmaj7 Fmaj7 Bm7b5 E7 Am7.
-(defn progression-root-midi [position]
-  (cond
-    (= position 0) 57  ; A3
-    (= position 1) 50  ; D3
-    (= position 2) 55  ; G3
-    (= position 3) 48  ; C3
-    (= position 4) 53  ; F3
-    (= position 5) 47  ; B2
-    (= position 6) 52  ; E3
-    57))               ; A3
-
-(defn progression-intervals [position]
-  (cond
-    (or (= position 0) (= position 1) (= position 7)) [0 3 7 10 12]
-    (or (= position 2) (= position 6)) [0 4 7 10 12]
-    (or (= position 3) (= position 4)) [0 4 7 11 12]
-    [0 3 6 10 12]))  ; Bm7b5
-
-(defn progression-chord-line [position start bar-seconds amplitude]
-  (let [base (progression-root-midi position)
-        intervals (progression-intervals position)
-        pattern [0 1 2 3 4 3 2 1]
-        note-step (/ bar-seconds 8.0)
-        note-length (* note-step 1.3)
-        root-length (* bar-seconds 0.98)
+; Sustain the root at each chord change, including the half-bar changes.
+; Tap the remaining eighths; release the last tap before the harmony changes.
+(defn progression-chord-line [base intervals start chord-seconds note-step note-count amplitude]
+  (let [pattern [0 1 2 3 4 3 2 1]
+        root-length (* chord-seconds 0.98)
         line (String.copy "")]
     (do
-      ; Eight eighth-notes: root, third, fifth, seventh, octave, and back.
-      ; The bass root (index 0) rings the whole bar on the sustaining/vibrato
-      ; electric voice (instr 2); every other note is right-hand tapping
-      ; (instr 4), short and percussive.
-      (for [index 0 8]
+      (for [index 0 note-count]
         (let [interval @(Array.unsafe-nth &intervals @(Array.unsafe-nth &pattern index))
+              offset (* (Double.from-int index) note-step)
               frequency (midi-hz (+ base interval))
-              at (+ start (* (Double.from-int index) note-step))
+              note-length (min (* note-step 1.3) (- chord-seconds offset))
               note-line (if (= index 0)
-                          (str* "i 2 " at " " root-length " " frequency
+                          (str* "i 2 " start " " root-length " " frequency
                                 " " (/ amplitude 2.2) " 0.0\n")
-                          (str* "i 4 " at " " note-length " " frequency
-                                " " (/ amplitude 2.5)
+                          (str* "i 4 " (+ start offset) " " note-length " " frequency
+                                " " (/ amplitude 4.0)
                                 " " (- 0.2 (* 0.06 (Double.from-int index))) "\n"))]
           (set! line (String.append &line &note-line))))
       line)))
 
+(defn melody-score [tick-seconds amplitude]
+  (let [notes (FlyMe.melody)
+        line (String.copy "")]
+    (do
+      (for [index 0 (/ (Array.length &notes) 3)]
+        (let [offset (* index 3)
+              start (* (Double.from-int @(Array.unsafe-nth &notes offset)) tick-seconds)
+              duration (* (Double.from-int @(Array.unsafe-nth &notes (+ offset 1))) tick-seconds)
+              frequency (midi-hz @(Array.unsafe-nth &notes (+ offset 2)))
+              note-line (str* "i 6 " start " " duration " " frequency
+                              " " (* amplitude 0.65) " 0.3\n")]
+          (set! line (String.append &line &note-line))))
+      line)))
+
+; One complete 32-bar chorus, not four repeats of the opening eight bars.
 (defn progression-score [bpm amplitude]
-  (let [bar-seconds (/ 240.0 bpm)
+  (let [tick-seconds (/ 15.0 bpm)
+        bar-seconds (* tick-seconds 16.0)
         end-seconds (* 32.0 bar-seconds)
+        harmony (FlyMe.harmony)
         score (String.copy "")]
     (do
-      (for [step 0 32]
-        (let [bar-start (* (Double.from-int step) bar-seconds)
-              eighth (/ bar-seconds 8.0)
-              chord-line (progression-chord-line (mod step 8)
-                                                  bar-start
-                                                  bar-seconds
-                                                  amplitude)
-              ; Syncopation: keep the downbeat clear for the root. Push the
-              ; kick an eighth-note late (the "and" of beat 1), with a lighter
-              ; answer on the "and" of beat 3 for a floating latin feel.
-              kick-line (str* "i 5 " (+ bar-start eighth) " 0.35 " (* amplitude 0.6)
-                              "\ni 5 " (+ bar-start (* 5.0 eighth)) " 0.35 " (* amplitude 0.4) "\n")]
-          (do
-            (set! score (String.append &score &chord-line))
-            (set! score (String.append &score &kick-line)))))
-      (str* &score "i 99 " end-seconds " 0.01\nf 0 z\n"))))
+      (for [index 0 (/ (Array.length &harmony) 6)]
+        (let [offset (* index 6)
+              at @(Array.unsafe-nth &harmony offset)
+              start (* (Double.from-int at) tick-seconds)
+              ticks @(Array.unsafe-nth &harmony (+ offset 1))
+              base @(Array.unsafe-nth &harmony (+ offset 2))
+              third @(Array.unsafe-nth &harmony (+ offset 3))
+              fifth @(Array.unsafe-nth &harmony (+ offset 4))
+              seventh @(Array.unsafe-nth &harmony (+ offset 5))
+              intervals [0 third fifth seventh 12]
+              chord-line (progression-chord-line base intervals start
+                                                (* (Double.from-int ticks) tick-seconds)
+                                                (* tick-seconds 2.0) (/ ticks 2) amplitude)
+              ; Numeric cue fields reuse the exact pitches of the chord.
+              ; Csound formats the name when this event actually runs.
+              cue-line (str* "i 7 " start " 0.001 " (+ (/ at 16) 1) " "
+                             (+ (/ (mod at 16) 4) 1) " " base " "
+                             third " " fifth " " seventh "\n")]
+          (set! score (str* &score chord-line cue-line))))
+      (for [bar 0 32]
+        (let [start (* (Double.from-int bar) bar-seconds)
+              ; Leave chord changes clear: kicks on the and of beats 1 and 3.
+              kick-line (str* "i 5 " (+ start (* tick-seconds 2.0)) " 0.35 " (* amplitude 0.6)
+                              "\ni 5 " (+ start (* tick-seconds 10.0)) " 0.35 " (* amplitude 0.4) "\n")]
+          (set! score (String.append &score &kick-line))))
+      (str* &score (melody-score tick-seconds amplitude)
+            "i 99 " end-seconds " 0.01\nf 0 z\n"))))
 
 (defn main []
   (if (/= (StaticArray.length &System.args) 8)
-    (IO.errorln "Usage: guitar-score <guitar|chord|mode|root> <root> <quality> <octave> <bpm> <envelope-seconds> <amplitude>")
+    (IO.errorln "Usage: guitar-score <guitar|chord|mode|root|progression> <root> <quality> <octave> <bpm> <envelope-seconds> <amplitude>")
     (let [kind @(StaticArray.unsafe-nth &System.args 1)
           root @(StaticArray.unsafe-nth &System.args 2)
           quality @(StaticArray.unsafe-nth &System.args 3)

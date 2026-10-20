@@ -57,7 +57,7 @@
     (when (and (= kind "mode") (not (accepted-modes quality)))
       (fail! (str "Unknown mode: " quality)))
     (when (and (= kind "progression") (or (not= root "a") (not= quality "minor")))
-      (fail! "This progression is the fixed Am7–Dm7–G7–Cmaj7–Fmaj7–Bm7b5–E7–Am7 form."))
+      (fail! "This is the fixed 32-bar Fly Me to the Moon arrangement in C/Am; use progression a minor."))
     (parse-number octave "Octave" 0 7)
     (when-not (re-matches #"[0-7]" octave) (fail! "Octave must be an integer 0–7"))
     (parse-number bpm "BPM" 20 240)
@@ -86,6 +86,40 @@
           second
           Double/parseDouble))
 
+(defn parse-chord [log]
+  (let [plain-log (str/replace log #"\u001b\[[0-9;]*m" "")]
+    (when-let [[_ bar beat chord]
+               (last (re-seq #"(?m)^CHORD bar=(\d+)/32 beat=([13]) name=([A-G][#b]?(?:maj7|m7b5|m7|7))\r?\n"
+                             plain-log))]
+      {:bar (Long/parseLong bar) :beat (Long/parseLong beat) :chord chord})))
+
+(defn current-chord []
+  (try
+    (parse-chord (slurp log-file))
+    (catch java.io.FileNotFoundException _ nil)))
+
+(defn format-chord [{:keys [bar beat chord]}]
+  (format "Bar %02d/32 | beat %d | %s" bar beat chord))
+
+(defn follow-chords! [pid current-pid read-chord emit! pause!]
+  (loop [previous nil]
+    (if (= pid (current-pid))
+      (let [chord (read-chord)]
+        (when (and chord (not= chord previous))
+          (emit! (format-chord chord)))
+        (pause!)
+        (recur (or chord previous)))
+      (emit! "Chord display detached (playback stopped or replaced)."))))
+
+(defn watch! []
+  (if-let [pid (owned-process)]
+    (let [{:keys [kind]} (edn/read-string (slurp pid-file))]
+      (when-not (= kind "progression")
+        (fail! "Live chord output requires bb play progression (restart older playback first)."))
+      (println "Following chords. Ctrl+C detaches this display; bb stop stops audio.")
+      (follow-chords! pid owned-process current-chord println #(Thread/sleep 100)))
+    (println "Stopped (no Csound process owned by this project).")))
+
 (defn status! []
   (if-let [pid (owned-process)]
     (let [{:keys [started-at score-end]} (edn/read-string (slurp pid-file))
@@ -94,7 +128,9 @@
           score-remaining (max 0 (long (Math/ceil (- score-end elapsed))))]
       (println (str "Playing (Csound PID " pid "; score ends in ~" score-remaining
                     "s; wall-clock safety cap in " remaining "s): "
-                    (str/trim (first (str/split-lines (slurp score-file)))))))
+                    (str/trim (first (str/split-lines (slurp score-file))))))
+      (when-let [chord (current-chord)]
+        (println (format-chord chord))))
     (println "Stopped (no Csound process owned by this project).")))
 
 (defn stop! []
@@ -138,27 +174,41 @@
                                     {:dir root :out (io/file log-file) :err :out})
             pid (.pid (:proc worker))]
         (spit pid-file (pr-str {:pid pid
+                                :kind (first params)
                                 :started-at (System/currentTimeMillis)
                                 :score-end (score-end-seconds out)
                                 :score (str/trim (first (str/split-lines out)))}))
         (Thread/sleep 750)
         (if (owned-process)
-          (println (str "Playing via Csound PID " pid ": " (str/trim (first (str/split-lines out)))))
+          (do
+            (println (str "Playing via Csound PID " pid ": " (str/trim (first (str/split-lines out)))))
+            (when (= "progression" (first params))
+              (when-let [chord (current-chord)] (println (format-chord chord)))
+              (println "Live chord output: bb watch")))
           (do (fs/delete-if-exists pid-file)
               (fail! (str "Csound exited early. See " log-file "\n" (slurp log-file)))))))))
 
 (defn -main [& args]
-  (fs/create-dirs state-dir)
   (case (first args)
     "build" (do (build!) (println "Built Carp score generator."))
     "play" (play! (rest args))
     "stop" (stop!)
     "status" (status!)
-    (fail! "Usage: bb build | bb play [kind root quality octave bpm envelope amp] | bb stop | bb status")))
+    "watch" (watch!)
+    (fail! "Usage: bb build | bb play [kind root quality octave bpm envelope amp] | bb stop | bb status | bb watch")))
 
-(fs/create-dirs state-dir)
-(with-open [file (java.io.RandomAccessFile. (str (fs/path state-dir "controller.lock")) "rw")
-            channel (.getChannel file)]
-  (.lock channel)
-  ;; Closing the channel releases its lock (FileLock.close is not exposed by bb).
-  (apply -main *command-line-args*))
+(defn run-controller! [args]
+  (fs/create-dirs state-dir)
+  (if (= "watch" (first args))
+    ;; Watching must not hold the controller lock: stop/play must stay usable.
+    (apply -main args)
+    (with-open [file (java.io.RandomAccessFile. (str (fs/path state-dir "controller.lock")) "rw")
+                channel (.getChannel file)]
+      (.lock channel)
+      ;; Closing the channel releases its lock (FileLock.close is not exposed by bb).
+      (apply -main args))))
+
+;; Loading this file for tests defines functions without starting a controller.
+(when (= (fs/real-path *file*)
+         (some-> (System/getProperty "babashka.file") fs/real-path))
+  (run-controller! *command-line-args*))
