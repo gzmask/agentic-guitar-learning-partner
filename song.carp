@@ -1,0 +1,233 @@
+; Fly Me to the Moon -- Bart Howard. One 32-bar chorus, 64 BPM, two minutes.
+; Play:   carp -x song.carp                 (low volume first; Ctrl+C stops)
+; Render: SONG_WAV=/tmp/song.wav carp -x song.carp    (no live audio)
+; Requires Carp, a C compiler, Csound and system Perl. Build files stay in temp.
+; Notes transposed F -> C, ties merged, from:
+; https://github.com/red-jackets-jazzband/website/blob/fa5d9123ad3ecc5a9c597967b9d15e3826beec45/static/songs/fly_me_to_the_moon.abc
+
+(Project.config "title" "song")
+(Project.config "output-directory"
+  (str (if (Dynamic.nil? (get-env "TMPDIR")) "/tmp/" (get-env "TMPDIR"))
+       "carp-fly-me-to-moon"))
+
+; Sixteenth-note ticks. Chord intervals are semitones above its root MIDI.
+(deftype Chord [at Int length Int root Int third Int fifth Int seventh Int])
+(deftype Note [at Int length Int midi Int])
+
+(defn harmony []
+  [(Chord.init 0 16 57 3 7 10)
+   (Chord.init 16 16 50 3 7 10)
+   (Chord.init 32 16 55 4 7 10)
+   (Chord.init 48 8 48 4 7 11)
+   (Chord.init 56 8 48 4 7 10)
+   (Chord.init 64 16 53 4 7 11)
+   (Chord.init 80 16 47 3 6 10)
+   (Chord.init 96 16 52 4 7 10)
+   (Chord.init 112 8 57 3 7 10)
+   (Chord.init 120 8 57 4 7 10)
+   (Chord.init 128 16 50 3 7 10)
+   (Chord.init 144 16 55 4 7 10)
+   (Chord.init 160 16 48 4 7 11)
+   (Chord.init 176 8 52 3 7 10)
+   (Chord.init 184 8 57 4 7 10)
+   (Chord.init 192 16 50 3 7 10)
+   (Chord.init 208 16 55 4 7 10)
+   (Chord.init 224 8 50 3 7 10)
+   (Chord.init 232 8 48 4 7 11)
+   (Chord.init 240 8 47 3 6 10)
+   (Chord.init 248 8 52 4 7 10)
+   (Chord.init 256 16 57 3 7 10)
+   (Chord.init 272 16 50 3 7 10)
+   (Chord.init 288 16 55 4 7 10)
+   (Chord.init 304 8 48 4 7 11)
+   (Chord.init 312 8 48 4 7 10)
+   (Chord.init 320 16 53 4 7 11)
+   (Chord.init 336 16 47 3 6 10)
+   (Chord.init 352 16 52 4 7 10)
+   (Chord.init 368 8 57 3 7 10)
+   (Chord.init 376 8 57 4 7 10)
+   (Chord.init 384 16 50 3 7 10)
+   (Chord.init 400 16 55 4 7 10)
+   (Chord.init 416 16 52 3 7 10)
+   (Chord.init 432 16 57 4 7 10)
+   (Chord.init 448 16 50 3 7 10)
+   (Chord.init 464 16 55 4 7 10)
+   (Chord.init 480 16 48 4 7 11)
+   (Chord.init 496 16 48 4 7 11)])
+
+; Gaps are rests; ties are single notes.
+(defn melody []
+  [(Note.init 0 4 72) (Note.init 4 4 71)
+   (Note.init 8 2 69) (Note.init 10 6 67)
+   (Note.init 16 6 65) (Note.init 22 2 67)
+   (Note.init 24 4 69) (Note.init 28 4 72)
+   (Note.init 32 4 71) (Note.init 36 4 69)
+   (Note.init 40 2 67) (Note.init 42 6 65)
+   (Note.init 48 15 64) (Note.init 64 4 69)
+   (Note.init 68 4 67) (Note.init 72 2 65)
+   (Note.init 74 6 64) (Note.init 80 6 62)
+   (Note.init 86 2 64) (Note.init 88 4 65)
+   (Note.init 92 4 69) (Note.init 96 4 68)
+   (Note.init 100 4 65) (Note.init 104 2 64)
+   (Note.init 106 6 62) (Note.init 112 11 60)
+   (Note.init 124 4 61) (Note.init 128 2 62)
+   (Note.init 130 4 69) (Note.init 134 13 69)
+   (Note.init 148 8 72) (Note.init 156 4 71)
+   (Note.init 160 27 67) (Note.init 188 4 59)
+   (Note.init 192 2 60) (Note.init 194 4 65)
+   (Note.init 198 13 65) (Note.init 212 8 69)
+   (Note.init 220 4 67) (Note.init 224 8 65)
+   (Note.init 232 23 64) (Note.init 256 4 72)
+   (Note.init 260 4 71) (Note.init 264 2 69)
+   (Note.init 266 6 67) (Note.init 272 6 65)
+   (Note.init 278 2 67) (Note.init 280 4 69)
+   (Note.init 284 4 72) (Note.init 288 4 71)
+   (Note.init 292 4 69) (Note.init 296 2 67)
+   (Note.init 298 6 65) (Note.init 304 15 64)
+   (Note.init 320 4 69) (Note.init 324 4 67)
+   (Note.init 328 2 65) (Note.init 330 6 64)
+   (Note.init 336 4 62) (Note.init 340 4 64)
+   (Note.init 344 4 65) (Note.init 348 4 69)
+   (Note.init 352 4 68) (Note.init 356 4 65)
+   (Note.init 360 2 64) (Note.init 362 6 62)
+   (Note.init 368 11 60) (Note.init 380 4 61)
+   (Note.init 384 2 62) (Note.init 386 4 69)
+   (Note.init 390 13 69) (Note.init 404 8 72)
+   (Note.init 412 4 71) (Note.init 416 27 76)
+   (Note.init 444 4 72) (Note.init 448 2 74)
+   (Note.init 450 4 69) (Note.init 454 13 69)
+   (Note.init 468 8 71) (Note.init 476 4 74)
+   (Note.init 480 32 72)])
+
+(defn orchestra []
+  (String.copy "sr = 48000
+ksmps = 64
+nchnls = 2
+0dbfs = 1
+
+; score: i 2 (root/strum) or i 6 (lead) start duration freq amplitude pan
+; Roots and lead share the selected electric tone, but remain separate tracks.
+instr 2, 6
+  ; Fit attack/release inside short lead notes, even at 240 BPM.
+  iattack = min(0.006, p3 * 0.1)
+  idecay = min(0.05, p3 * 0.15)
+  irelease = min(0.09, p3 * 0.25)
+  iplateau = p3 - iattack - idecay - irelease
+  aenv linseg 0, iattack, 1, idecay, 0.85, iplateau, 0.8, irelease, 0
+  astr pluck p5, p4, p4, 0, 1
+  ; sustained tone layer (fundamental + octave) reinforces the string
+  ; delayed vibrato: depth ramps in ~0.35s after the note, ~5.5 Hz, +/-1.5%
+  kvibdepth linseg 0, 0.35, 0, 0.25, 1
+  kvib oscili kvibdepth * 0.015, 5.5
+  kvfreq = p4 * (1 + kvib)
+  asus1 oscili p5 * 0.5, kvfreq
+  asus2 oscili p5 * 0.22, kvfreq * 2
+  amix = astr + asus1 + asus2
+  ; soft overdrive: harmonics, compression and sustain (amp-driven)
+  idrive = 30
+  adrv = tanh(amix * idrive) * p5 * 1.2
+  ; tame the fizz without killing the bite
+  adrv tone adrv, 2800
+  ; Keep the melody as a quiet guide (~14 dB cut), preserving its drive tone.
+  ivoicegain = (p1 == 6 ? 0.2 : 1)
+  adrv = adrv * ivoicegain
+  aleft = adrv * aenv * sqrt((1 - p6) / 2)
+  aright = adrv * aenv * sqrt((1 + p6) / 2)
+  outs aleft, aright
+endin
+
+; score: i 4 start duration freq amplitude pan
+; Right-hand tapping voice: percussive attack, short decay, electric drive,
+; no vibrato and no long sustain plateau -- the melodic counterpart to the
+; ringing root on instr 2.
+instr 4
+  aenv linseg 0, 0.004, 1, 0.03, 0.5, max(0.01, p3 - 0.1), 0.18, 0.066, 0
+  astr pluck p5, p4, p4, 0, 1
+  abody oscili p5 * 0.3, p4
+  amix = astr + abody
+  adrv = tanh(amix * 24) * p5 * 1.1
+  adrv tone adrv, 3200
+  ; Bring chord-defining thirds/sevenths forward by ~6 dB, after overdrive.
+  adrv = adrv * 2
+  aleft = adrv * aenv * sqrt((1 - p6) / 2)
+  aright = adrv * aenv * sqrt((1 + p6) / 2)
+  outs aleft, aright
+endin
+
+; A restrained kick: low-frequency sweeps on the and of beats 1 and 3.
+; score: i 5 start 0.35 amplitude
+instr 5
+  aenv expseg 1, 0.35, 0.0001
+  kfreq expseg 145, 0.09, 52, 0.26, 46
+  akick oscili p4 * aenv, kfreq
+  outs akick, akick
+endin
+
+instr 99
+  exitnow
+endin
+"))
+
+(defn hz [midi]
+  (* 440.0 (Double.pow 2.0 (/ (Double.from-int (- midi 69)) 12.0))))
+
+(def tick (/ 15.0 64.0))
+(def amplitude 0.18)
+
+; A chord becomes one sustained root followed by eighth-note chord-tone taps.
+(defn chord-lines [chord]
+  (let [length @(Chord.length chord)
+        pitches (Array.take (/ length 2)
+                            &[0 @(Chord.third chord) @(Chord.fifth chord)
+                              @(Chord.seventh chord) 12 @(Chord.seventh chord)
+                              @(Chord.fifth chord) @(Chord.third chord)])]
+    (Array.copy-map
+      &(fn [indexed]
+         (let [i @(Pair.a indexed)
+               pitch (+ @(Chord.root chord) @(Pair.b indexed))
+               start (* (Double.from-int (+ @(Chord.at chord) (* i 2))) tick)
+               duration (* (min 2.6 (Double.from-int (- length (* i 2)))) tick)]
+           (if (= i 0)
+             (str* "i 2 " start " " (* (* (Double.from-int length) tick) 0.98)
+                   " " (hz pitch) " " (/ amplitude 2.2) " 0\n")
+             (str* "i 4 " start " " duration " " (hz pitch)
+                   " " (/ amplitude 4.0) " "
+                   (- 0.2 (* 0.06 (Double.from-int i))) "\n"))))
+      &(Array.enumerated &pitches))))
+
+; Syncopated kicks on the and of beats 1 and 3.
+(defn kick-lines [bar]
+  [(str* "i 5 " (* (Double.from-int (+ (* @bar 16) 2)) tick)
+         " 0.35 " (* amplitude 0.6) "\n")
+   (str* "i 5 " (* (Double.from-int (+ (* @bar 16) 10)) tick)
+         " 0.35 " (* amplitude 0.4) "\n")])
+
+(defn melody-line [note]
+  (str* "i 6 " (* (Double.from-int @(Note.at note)) tick) " "
+        (* (Double.from-int @(Note.length note)) tick) " " (hz @(Note.midi note))
+        " " (* amplitude 0.65) " 0.3\n"))
+
+(defn score []
+  (String.concat
+    &[(String.concat &(Array.flat-map &chord-lines &(harmony)))
+      (String.concat &(Array.flat-map &kick-lines &(Array.range-or-default 0 31 1)))
+      (String.concat &(Array.copy-map &melody-line &(melody)))
+      @"i 99 120 0.01\nf 0 z\n"]))
+
+; POSIX pipe: feed the entire synth/score to foreground Csound on stdin.
+(register popen (Fn [(Ptr CChar) (Ptr CChar)] (Ptr FILE)) "popen")
+(register pclose (Fn [(Ptr FILE)] Int) "pclose")
+
+(defn main []
+  (let [document (str* "<CsoundSynthesizer>\n<CsInstruments>\n" (orchestra)
+                       "</CsInstruments>\n<CsScore>\n" (score)
+                       "</CsScore>\n</CsoundSynthesizer>\n")
+        ; The score ends at 120s; alarm also caps wall time at 600s.
+        ; The output path comes from a quoted environment variable, not shell code.
+        command "if [ -n \"$SONG_WAV\" ]; then set -- -W -o \"$SONG_WAV\"; else set -- -odac; fi; exec /usr/bin/perl -e 'alarm 600; exec @ARGV or die $!' csound -d -m0 \"$@\" /dev/stdin"
+        pipe (popen (String.cstr command) (String.cstr "w"))]
+    (if (null? pipe)
+      (do (IO.errorln "Could not start Csound.") 1)
+      (let [written (IO.Raw.fwrite &document 1 (String.length &document) pipe)
+            status (pclose pipe)]
+        (if (and (= written (String.length &document)) (= status 0)) 0 1)))))
