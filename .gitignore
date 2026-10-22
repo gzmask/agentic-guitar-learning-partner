@@ -1,8 +1,4 @@
-out/
-.state/
-.cpcache/
-.clj-kondo/
-.nrepl-port
-.DS_Store
 *.wav
 *.aiff
+.clj-kondo/
+.DS_Store
