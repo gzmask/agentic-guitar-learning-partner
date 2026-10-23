@@ -1,0 +1,282 @@
+#!/usr/bin/env jolt
+;; Guitar-controlled note looper. Csound performs detection, control and DSP.
+;; jolt guitar-gesture-looper.jolt adc2 dac5       (low volume/headphones first)
+;; jolt guitar-gesture-looper.jolt --check        (no audio devices)
+;; C5 D5 C5 D5: start recording. D5 C5 D5 C5: finish, loop; repeat to exit.
+;; C4 = MIDI 60, so C5/D5 = MIDI 72/74. Four confirmed notes within four seconds.
+;; Live guitar always passes through at -6 dB; only the captured take is synthesized.
+;; Recording is in memory, not a WAV/file. Ctrl+C stops; score/alarm limit 600s.
+
+(require '[clojure.java.shell :refer [sh]])
+(require '[clojure.string :as str])
+
+
+(def orchestra
+  "sr = 44100
+ksmps = 32
+nchnls = 2
+0dbfs = 1
+
+; state: 0=idle, 1=recording, 2=playback, 3=exiting.
+gkState init 0
+gkEnd init 600
+gkRecordStart init 0
+gkPlayStart init 0
+gkLoopLength init 0.1
+gkCount init 0
+gkRecordActive init -1
+; 600 seconds / 55 ms < 10910 confirmed notes. Capacity includes command notes.
+gkStarts[] init 16384
+gkLengths[] init 16384
+gkMidis[] init 16384
+gaLeft init 0
+gaRight init 0
+
+opcode CloseNote, 0, k
+  kend xin
+  if gkRecordActive >= 0 then
+    gkLengths[gkRecordActive] = max(ksmps / sr, kend - gkRecordStart - gkStarts[gkRecordActive])
+    gkRecordActive = -1
+  endif
+endop
+
+instr 1
+  aleft, aright ins
+  gaLeft = gaLeft + aleft * 0.5
+  gaRight = gaRight + aright * 0.5
+endin
+
+instr 10
+  aleft, aright ins
+  ain = (aleft + aright) * 0.5
+  ; Native AMDF, no median filtering, downsampling or input prefilter.
+  kfreq, krms pitchamdf ain, 70, 1400, 0, 0, 1, 0, 0
+  kdb = 20 * log10(max(krms, 0.000000001))
+  kmidi = round(69 + 12 * log(max(kfreq, 0.000000001) / 440) / log(2))
+  ktime times
+  kgate init 0
+  kcandidate init -1
+  kactive init -1
+  kstable init 0
+  ksilent init 0
+  khistory[] init 4
+  kwhen[] init 4
+  khistoryCount init 0
+  knew = 0
+
+  if kgate == 0 then
+    if kdb > p4 then
+      kgate = 1
+    endif
+  elseif kdb < p4 - 6 then
+    kgate = 0
+  endif
+
+  if kgate == 1 && kfreq >= 70 && kfreq <= 1400 then
+    ksilent = 0
+    if kmidi != kcandidate then
+      kcandidate = kmidi
+      kstable = 0
+    else
+      kstable = kstable + ksmps / sr
+    endif
+    if kstable >= 0.055 && kcandidate != kactive then
+      kactive = kcandidate
+      knew = 1
+    endif
+  else
+    kcandidate = -1
+    kstable = 0
+    ksilent = ksilent + ksmps / sr
+    if ksilent >= 0.12 then
+      kactive = -1
+      if gkState == 1 then
+        CloseNote ktime - ksilent
+      endif
+    endif
+  endif
+
+  if knew == 1 && gkState < 3 then
+    printks \"NOTE t=%.3fs MIDI %d state=%d\\n\", 0, ktime, kactive, gkState
+    if gkState == 1 then
+      CloseNote ktime
+      if gkCount < 16384 then
+        gkStarts[gkCount] = ktime - gkRecordStart
+        gkLengths[gkCount] = 0
+        gkMidis[gkCount] = kactive
+        gkRecordActive = gkCount
+        gkCount = gkCount + 1
+      else
+        printks \"Recording capacity exceeded; exiting.\\n\", 0
+        gkState = 3
+        gkEnd = min(600, ktime + 0.03)
+        event \"i\", 99, 0.03, 0.01, 1
+      endif
+    endif
+
+    ; A sliding window preserves valid suffixes after wrong or slow notes.
+    if khistoryCount == 4 then
+      kindex = 0
+      while kindex < 3 do
+        khistory[kindex] = khistory[kindex + 1]
+        kwhen[kindex] = kwhen[kindex + 1]
+        kindex = kindex + 1
+      od
+      khistoryCount = 3
+    endif
+    khistory[khistoryCount] = kactive
+    kwhen[khistoryCount] = ktime
+    khistoryCount = khistoryCount + 1
+    kcomplete = (khistoryCount == 4 && ktime - kwhen[0] <= 4 ? 1 : 0)
+    kstart = (kcomplete == 1 && khistory[0] == 72 && khistory[1] == 74 && khistory[2] == 72 && khistory[3] == 74 ? 1 : 0)
+    kstop = (kcomplete == 1 && khistory[0] == 74 && khistory[1] == 72 && khistory[2] == 74 && khistory[3] == 72 ? 1 : 0)
+
+    if gkState == 0 && kstart == 1 then
+      gkRecordStart = ktime
+      gkState = 1
+      ; Consume the entire command: its suffix cannot stop this new recording.
+      khistoryCount = 0
+      printks \"STATE RECORDING t=%.6fs (D5 C5 D5 C5 to finish)\\n\", 0, ktime
+    elseif gkState == 1 && kstop == 1 then
+      ; The stop command was buffered as ordinary notes. Remove all four, and
+      ; end the phrase at its FIRST note, not after the four-note command.
+      gkCount = gkCount - 4
+      gkLoopLength = max(0.1, gkStarts[gkCount])
+      gkRecordActive = -1
+      gkPlayStart = ktime
+      gkState = 2
+      khistoryCount = 0
+      printks \"STATE PLAYBACK t=%.6fs duration=%.6fs notes=%d (D5 C5 D5 C5 to exit)\\n\", 0, ktime, gkLoopLength, gkCount
+    elseif gkState == 2 && kstop == 1 then
+      gkState = 3
+      gkEnd = min(600, ktime + 0.03)
+      printks \"STATE EXIT t=%.6fs (guitar command)\\n\", 0, ktime
+      event \"i\", 99, 0.03, 0.01, 0
+    endif
+  endif
+endin
+
+instr 20
+  ktime times
+  kprevious init -1
+  if gkState == 2 && ktime < gkEnd then
+    kcycle = int((ktime - gkPlayStart) / gkLoopLength)
+    if kcycle != kprevious then
+      printks \"LOOP cycle=%d notes=%d\\n\", 0, kcycle + 1, gkCount
+      kindex = 0
+      while kindex < gkCount do
+        kdelay = max(0, gkPlayStart + kcycle * gkLoopLength + gkStarts[kindex] - ktime)
+        kfreq = 440 * pow(2, (gkMidis[kindex] - 69) / 12)
+        event \"i\", 30, kdelay, gkLengths[kindex] + 0.15, kfreq, 0.18 / 2.2, 0
+        kindex = kindex + 1
+      od
+      kprevious = kcycle
+    endif
+  endif
+endin
+
+; song.carp's pluck/sustain/vibrato/overdrive guitar tone, with ringing overlap.
+instr 30
+  iattack = min(0.006, p3 * 0.1)
+  idecay = min(0.05, p3 * 0.15)
+  irelease = min(0.09, p3 * 0.25)
+  iplateau = p3 - iattack - idecay - irelease
+  aenv linseg 0, iattack, 1, idecay, 0.85, iplateau, 0.8, irelease, 0
+  astr pluck p5, p4, p4, 0, 1
+  kvibdepth linseg 0, 0.35, 0, 0.25, 1
+  kvib oscili kvibdepth * 0.015, 5.5
+  kvfreq = p4 * (1 + kvib)
+  asus1 oscili p5 * 0.5, kvfreq
+  asus2 oscili p5 * 0.22, kvfreq * 2
+  amix = astr + asus1 + asus2
+  adrv = tanh(amix * 30) * p5 * 1.2
+  adrv tone adrv, 2800
+  gaLeft = gaLeft + adrv * aenv * sqrt((1 - p6) / 2)
+  gaRight = gaRight + adrv * aenv * sqrt((1 + p6) / 2)
+endin
+
+instr 90
+  ktime times
+  kfade = min(1, max(0, (gkEnd - ktime) / 0.03))
+  outs gaLeft * kfade, gaRight * kfade
+  clear gaLeft, gaRight
+endin
+
+instr 99
+  exitnow p4
+endin
+")
+
+
+(def usage
+  (str "Usage: jolt guitar-gesture-looper.jolt [--gate=-44] [adcN dacN]\n"
+       "       jolt guitar-gesture-looper.jolt --check\n"
+       "Default adc2/dac5, raw stereo monitor -6 dB, RMS gate -44/-50 dBFS."))
+
+
+(defn parse-options
+  [args]
+  (let [gates (filter #(str/starts-with? % "--gate=") args)
+        gate (if (seq gates) (parse-double (subs (first gates) 7)) -44.0)
+        devices (vec (remove #(or (= % "--check") (str/starts-with? % "--gate=")) args))
+        [input output] (if (empty? devices) ["adc2" "dac5"] devices)]
+    (when-not (and (<= (count gates) 1) (number? gate) (<= -90 gate -6)
+                   (or (empty? devices) (= 2 (count devices)))
+                   (re-matches #"adc[0-9]+" input) (re-matches #"dac[0-9]+" output))
+      (throw (ex-info usage {})))
+    {:check? (boolean (some #{"--check"} args))
+     :gate gate :input input :output output}))
+
+
+(defn csound-document
+  [{:keys [gate]}]
+  (str "<CsoundSynthesizer>\n<CsInstruments>\n" orchestra
+       "</CsInstruments>\n<CsScore>\n"
+       "i 1 0 600\ni 10 0 600 " gate "\ni 20 0 600\ni 90 0 600\n"
+       "i 99 600 0.01 0\ne\n</CsScore>\n</CsoundSynthesizer>\n"))
+
+
+(defn engine-command
+  [{:keys [check? input output]}]
+  (into ["/usr/bin/perl" "-e"
+         (str (when-not check?
+                ;; shell/sh captures logs; reconnect the engine for live feedback.
+                (str "if (open(TTY, q(>), q(/dev/tty))) { "
+                     "open(STDOUT, q(>&), TTY); open(STDERR, q(>&), TTY); } "))
+              "alarm 600; exec @ARGV or die $!")
+         "csound" "-d" "-m0" "-+msg_color=0"]
+        (if check?
+          ["--syntax-check-only" "/dev/stdin"]
+          ["-+rtaudio=coreaudio" (str "-i" input) (str "-o" output) "/dev/stdin"])))
+
+
+(defn fail
+  [message]
+  (binding [*out* *err*]
+    (println message))
+  (System/exit 2))
+
+
+(let [{:keys [check? gate input output] :as options}
+      (try
+        (parse-options *command-line-args*)
+        (catch Exception error
+          (fail (ex-message error))))]
+  (when-not check?
+    (println (str "Guitar gesture looper: " input " -> " output "; raw stereo monitor -6 dB."))
+    (println "IDLE: C5 D5 C5 D5 -> RECORDING; D5 C5 D5 C5 -> PLAYBACK; repeat -> EXIT.")
+    (println "C5=MIDI 72, D5=MIDI 74. Each command is four fresh confirmed notes within 4 seconds.")
+    (println (str "RMS gate " gate "/" (- gate 6) " dBFS; 55 ms confirmation, 120 ms release."))
+    (println "Command notes are excluded. Take stays in memory; new playing remains raw during synth playback.")
+    (println "Low volume/headphones; verify FX100 input and avoid feedback/direct-monitor doubling.")
+    (println "Foreground only: Ctrl+C also stops. Score/alarm limit 600 seconds.")
+    (flush))
+  (let [{:keys [exit out err]}
+        (apply sh (concat (engine-command options) [:in (csound-document options)]))]
+    (when-not (str/blank? out)
+      (print out))
+    (when-not (str/blank? err)
+      (binding [*out* *err*]
+        (print err)))
+    (when-not (zero? exit)
+      (System/exit exit))))

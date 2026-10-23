@@ -1,0 +1,181 @@
+#!/usr/bin/env jolt
+;; Monophonic FX100 pitch tracking using Csound AMDF (not ptrack).
+;; jolt guitar-pitchamdf.jolt --monitor adc2 dac5
+;; Add --raw for 10 Hz estimates, or --gate=-48 for a quieter input.
+;; --check opens no audio devices. Ctrl+C stops; safety limit is 600 seconds.
+
+(require '[clojure.java.shell :refer [sh]])
+(require '[clojure.string :as str])
+
+
+(def orchestra
+  "sr = 44100
+ksmps = 32
+nchnls = 2
+0dbfs = 1
+
+strset 1, \"C\"
+strset 2, \"C#\"
+strset 3, \"D\"
+strset 4, \"D#\"
+strset 5, \"E\"
+strset 6, \"F\"
+strset 7, \"F#\"
+strset 8, \"G\"
+strset 9, \"G#\"
+strset 10, \"A\"
+strset 11, \"A#\"
+strset 12, \"B\"
+
+instr 1
+  aleft, aright ins
+  ain = (aleft + aright) * 0.5
+  ; min/max Hz, initial estimate=auto, pitch median=off, downsample=1,
+  ; native analysis rate (iexcps=0), RMS median=off. No prefilter or song knowledge.
+  kfreq, krms pitchamdf ain, 70, 1400, 0, 0, 1, 0, 0
+  kdb = 20 * log10(max(krms, 0.000000001))
+  kpitch = 69 + 12 * log(max(kfreq, 0.000000001) / 440) / log(2)
+  kmidi = round(kpitch)
+  kcents = 100 * (kpitch - kmidi)
+  ktime timeinsts
+
+  kgate init 0
+  kcandidate init -1
+  kactive init -1
+  kstable init 0
+  ksilent init 0
+
+  ; p6 is the opening RMS threshold; close 6 dB below it.
+  if kgate == 0 then
+    if kdb > p6 then
+      kgate = 1
+    endif
+  elseif kdb < p6 - 6 then
+    kgate = 0
+  endif
+
+  kvalid = 0
+  if kgate == 1 && kfreq >= 70 && kfreq <= 1400 then
+    kvalid = 1
+  endif
+  if kvalid == 1 then
+    ksilent = 0
+    if kmidi != kcandidate then
+      kcandidate = kmidi
+      kstable = 0
+    else
+      kstable = kstable + ksmps / sr
+    endif
+    if kstable >= 0.055 && kcandidate != kactive then
+      if p5 == 0 then
+        event \"i\", 2, 0, 0.01, kcandidate, kfreq, kdb, ktime, kcents
+      endif
+      kactive = kcandidate
+    endif
+  else
+    kcandidate = -1
+    kstable = 0
+    ksilent = ksilent + ksmps / sr
+    if ksilent >= 0.12 then
+      kactive = -1
+    endif
+  endif
+
+  ; Raw mode bypasses note confirmation, but still marks gated estimates invalid.
+  kreport metro 10
+  if p5 == 1 && kreport == 1 then
+    if kvalid == 1 then
+      event \"i\", 3, 0, 0.01, kmidi, kfreq, kdb, ktime, kcents
+    else
+      printks \"RAW t=%.3fs MIDI -- note=-- %.2f Hz RMS %.1f dBFS (gated/invalid)\\n\", 0, ktime, kfreq, kdb
+    endif
+  endif
+
+  ; Independent stereo monitoring at -6 dB when enabled; otherwise silent.
+  outs aleft * p4, aright * p4
+endin
+
+instr 2, 3
+  imidi = i(p4)
+  ioctave = int(imidi / 12) - 1
+  Sname strget (imidi % 12) + 1
+  if p1 == 3 then
+    prints \"RAW \"
+  endif
+  printf_i \"t=%.3fs MIDI %d %s%d %.2f Hz %+.1f cents RMS %.1f dBFS\\n\", 1, p7, imidi, Sname, ioctave, p5, p8, p6
+endin
+")
+
+
+(def usage
+  (str "Usage: jolt guitar-pitchamdf.jolt [--monitor] [--raw] [--gate=-44] [adcN dacN]\n"
+       "       jolt guitar-pitchamdf.jolt --check\n"
+       "Default: adc2/dac4, silent output, RMS gate -44/-50 dBFS."))
+
+
+(defn parse-options
+  [args]
+  (let [flags #{"--monitor" "--raw" "--check"}
+        gate-args (filter #(str/starts-with? % "--gate=") args)
+        gate (if (seq gate-args) (parse-double (subs (first gate-args) 7)) -44.0)
+        devices (vec (remove #(or (flags %) (str/starts-with? % "--gate=")) args))
+        [input output] (if (empty? devices) ["adc2" "dac4"] devices)]
+    (when-not (and (<= (count gate-args) 1) (number? gate) (<= -90 gate -6)
+                   (or (empty? devices) (= 2 (count devices)))
+                   (re-matches #"adc[0-9]+" input) (re-matches #"dac[0-9]+" output))
+      (throw (ex-info usage {})))
+    {:check? (boolean (some #{"--check"} args))
+     :monitor? (boolean (some #{"--monitor"} args))
+     :raw? (boolean (some #{"--raw"} args))
+     :gate gate :input input :output output}))
+
+
+(defn csound-document
+  [{:keys [monitor? raw? gate]}]
+  (str "<CsoundSynthesizer>\n<CsInstruments>\n" orchestra
+       "</CsInstruments>\n<CsScore>\ni 1 0 600 " (if monitor? 0.5 0)
+       " " (if raw? 1 0) " " gate "\ne\n"
+       "</CsScore>\n</CsoundSynthesizer>\n"))
+
+
+(defn fail
+  [message]
+  (binding [*out* *err*]
+    (println message))
+  (System/exit 2))
+
+
+(let [{:keys [check? monitor? raw? gate input output] :as options}
+      (try
+        (parse-options *command-line-args*)
+        (catch Exception error
+          (fail (ex-message error))))
+      command
+      (if check?
+        ["csound" "--syntax-check-only" "-d" "-m0" "/dev/stdin"]
+        ["/usr/bin/perl" "-e"
+         ;; shell/sh captures output; reconnect Csound to the terminal for live logs.
+         (str "if (open(TTY, q(>), q(/dev/tty))) { "
+              "open(STDOUT, q(>&), TTY); open(STDERR, q(>&), TTY); } "
+              "alarm 600; exec @ARGV or die $!")
+         "csound" "-d" "-m0" "-+rtaudio=coreaudio"
+         (str "-i" input) (str "-o" output) "/dev/stdin"])]
+  (when-not check?
+    (println (str "pitchamdf: " input " -> " output "; "
+                  (if monitor? "monitor -6 dB" "silent output") "."))
+    (println "AMDF: 70..1400 Hz, native analysis rate, median filters off, no downsampling.")
+    (println (str "RMS gate " gate "/" (- gate 6) " dBFS; "
+                  (if raw? "raw estimates at 10 Hz." "55 ms stable pitch, 120 ms release.")))
+    (println "MIDI number, note/octave (C4=60), Hz, cents, AMDF RMS. No MIDI messages sent.")
+    (println "Foreground only. Ctrl+C stops; score/alarm cap runtime at 600 seconds.")
+    (when monitor?
+      (println "Use headphones/low volume; avoid duplicate direct monitoring or feedback."))
+    (flush))
+  (let [{:keys [exit out err]} (apply sh (concat command [:in (csound-document options)]))]
+    (when-not (str/blank? out)
+      (print out))
+    (when-not (str/blank? err)
+      (binding [*out* *err*]
+        (print err)))
+    (when-not (zero? exit)
+      (System/exit exit))))

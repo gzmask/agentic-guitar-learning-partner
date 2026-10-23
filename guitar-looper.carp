@@ -1,0 +1,337 @@
+; Record 60 seconds of pitchamdf notes, then loop synthesized guitar + live input.
+; Build: carp -b guitar-looper.carp          (binary: ./guitar-looper)
+; Run:   ./guitar-looper adc2 dac5           (FX100 -> Mac speakers; low volume)
+; Check: ./guitar-looper --check            (no audio devices or recording files)
+; Live guitar is always passed through at -6 dB, never replaced by synthesis.
+; After 60 seconds, detection stops; only the recorded notes are synthesized.
+; Ctrl+C stops the foreground group; score and OS alarm both end at 600 seconds.
+
+; The executable belongs in the build working directory; generated C stays in temp.
+(Project.config "title" (Path.absolute "guitar-looper"))
+(Project.config "output-directory"
+  (str (if (Dynamic.nil? (get-env "TMPDIR")) "/tmp" (get-env "TMPDIR"))
+       "/carp-guitar-looper"))
+; Keep macOS debug-symbol bundles out of the working directory as well.
+(Project.config "cflag" (cons-last "-g0" (Project.get-config "cflag")))
+
+(deftype Options [check Bool gate Double input String output String])
+(deftype Note [at Double length Double midi Int])
+
+(defn globals []
+  (String.copy "sr = 44100
+ksmps = 32
+nchnls = 2
+0dbfs = 1
+
+gaLeft init 0
+gaRight init 0
+"))
+
+; Same pluck, sustained oscillators, delayed vibrato, drive and filter as song.carp.
+; p4 = Hz, p5 = amplitude, p6 = pan. Independent instances allow ringing overlap.
+(defn guitar-voice []
+  (String.copy "
+instr 30
+  iattack = min(0.006, p3 * 0.1)
+  idecay = min(0.05, p3 * 0.15)
+  irelease = min(0.09, p3 * 0.25)
+  iplateau = p3 - iattack - idecay - irelease
+  aenv linseg 0, iattack, 1, idecay, 0.85, iplateau, 0.8, irelease, 0
+  astr pluck p5, p4, p4, 0, 1
+  kvibdepth linseg 0, 0.35, 0, 0.25, 1
+  kvib oscili kvibdepth * 0.015, 5.5
+  kvfreq = p4 * (1 + kvib)
+  asus1 oscili p5 * 0.5, kvfreq
+  asus2 oscili p5 * 0.22, kvfreq * 2
+  amix = astr + asus1 + asus2
+  adrv = tanh(amix * 30) * p5 * 1.2
+  adrv tone adrv, 2800
+  gaLeft = gaLeft + adrv * aenv * sqrt((1 - p6) / 2)
+  gaRight = gaRight + adrv * aenv * sqrt((1 + p6) / 2)
+endin
+"))
+
+(defn mixer []
+  (String.copy "
+instr 90
+  ktime times
+  ; Fade the final 30 ms, including live monitoring, before the fixed ending.
+  kfade = min(1, max(0, (p4 - ktime) / 0.03))
+  outs gaLeft * kfade, gaRight * kfade
+  clear gaLeft, gaRight
+endin
+
+instr 99
+  exitnow p4
+endin
+"))
+
+(defn recorder []
+  (String.copy "
+; At most ~1091 notes fit in 60 seconds with 55 ms confirmation; leave headroom.
+gkStarts[] init 2048
+gkLengths[] init 2048
+gkMidis[] init 2048
+gkCount init 0
+gkActive init -1
+gkStart init 0
+
+opcode StoreNote, 0, k
+  kend xin
+  if gkActive >= 0 then
+    if gkCount < 2048 then
+      kduration = max(ksmps / sr, min(kend, 60) - gkStart)
+      gkStarts[gkCount] = gkStart
+      gkLengths[gkCount] = kduration
+      gkMidis[gkCount] = gkActive
+      printks \"LOOP_NOTE %.6f %.6f %d\\n\", 0, gkStart, kduration, gkActive
+      gkCount = gkCount + 1
+    else
+      printks \"Recording capacity exceeded.\\n\", 0
+      event \"i\", 99, 0, 0.01, 1
+    endif
+    gkActive = -1
+  endif
+endop
+
+; Raw stereo input remains independent of detection and synthesized playback.
+instr 1
+  aleft, aright ins
+  gaLeft = gaLeft + aleft * 0.5
+  gaRight = gaRight + aright * 0.5
+endin
+
+; This instrument runs ONLY for the first 60 seconds. No overdubbing afterward.
+instr 10
+  aleft, aright ins
+  ain = (aleft + aright) * 0.5
+  kfreq, krms pitchamdf ain, 70, 1400, 0, 0, 1, 0, 0
+  kdb = 20 * log10(max(krms, 0.000000001))
+  kmidi = round(69 + 12 * log(max(kfreq, 0.000000001) / 440) / log(2))
+  ktime timeinsts
+  kgate init 0
+  kcandidate init -1
+  kstable init 0
+  ksilent init 0
+
+  if kgate == 0 then
+    if kdb > p4 then
+      kgate = 1
+    endif
+  elseif kdb < p4 - 6 then
+    kgate = 0
+  endif
+
+  if kgate == 1 && kfreq >= 70 && kfreq <= 1400 then
+    ksilent = 0
+    if kmidi != kcandidate then
+      kcandidate = kmidi
+      kstable = 0
+    else
+      kstable = kstable + ksmps / sr
+    endif
+    if kstable >= 0.055 && kcandidate != gkActive then
+      StoreNote ktime
+      gkActive = kcandidate
+      gkStart = ktime
+      printks \"DETECT t=%.3fs MIDI %d\\n\", 0, ktime, kcandidate
+    endif
+  else
+    kcandidate = -1
+    kstable = 0
+    ksilent = ksilent + ksmps / sr
+    if ksilent >= 0.12 then
+      ; End at the start of silence, rather than adding the release debounce.
+      StoreNote ktime - ksilent
+    endif
+  endif
+endin
+
+; Flush the last held note BEFORE the scheduler's first k-cycle at t=60.
+instr 11
+  kdone init 0
+  if kdone == 0 then
+    StoreNote 60
+    printks \"LOOP_READY %d\\n\", 0, gkCount
+    kdone = 1
+  endif
+endin
+
+; Replay the captured 60-second phrase nine times, mixed with new raw guitar.
+instr 20
+  ktime times
+  kcycle = int((ktime - 60) / 60)
+  kprevious init -1
+  if kcycle != kprevious && ktime < 600 then
+    printks \"LOOP_PLAY cycle=%d notes=%d (live guitar stays raw)\\n\", 0, kcycle + 1, gkCount
+    kindex = 0
+    while kindex < gkCount do
+      kfreq = 440 * pow(2, (gkMidis[kindex] - 69) / 12)
+      ; An extra 150 ms rings over the next note and across loop boundaries.
+      event \"i\", 30, gkStarts[kindex], gkLengths[kindex] + 0.15, kfreq, 0.18 / 2.2, 0
+      kindex = kindex + 1
+    od
+    kprevious = kcycle
+  endif
+endin
+"))
+
+(defn document [instruments score]
+  (str* "<CsoundSynthesizer>\n<CsInstruments>\n" instruments
+        "</CsInstruments>\n<CsScore>\n" score "</CsScore>\n</CsoundSynthesizer>\n"))
+
+(defn live-document [options]
+  (document &(str* (globals) (recorder) (guitar-voice) (mixer))
+            &(str* "i 1 0 600\ni 10 0 60 " @(Options.gate options)
+                   "\ni 11 60 0.01\ni 20 60 540\ni 90 0 600 600\ni 99 600 0.01 0\ne\n")))
+
+(defn note-line [note]
+  (let [frequency (* 440.0 (Double.pow 2.0 (/ (Double.from-int (- @(Note.midi note) 69)) 12.0)))]
+    (str* "i 30 " @(Note.at note) " " (+ @(Note.length note) 0.15)
+          " " frequency " " (/ 0.18 2.2) " 0 ; MIDI " @(Note.midi note) "\n")))
+
+; A standalone, single-pass synthetic take. It needs no input device or source file.
+(defn recording-document [notes]
+  (document &(str* (globals) (guitar-voice) (mixer))
+            &(str* (String.concat &(Array.copy-map &note-line notes))
+                   "i 90 0 60.15 60.15\ni 99 60.15 0.01 0\ne\n")))
+
+(defn usage []
+  (String.copy "Usage: ./guitar-looper [--gate=-44] [adcN dacN]
+       ./guitar-looper --check
+Default: adc2/dac5, raw stereo monitor -6 dB, RMS gate -44/-50 dBFS.
+Record notes for 60 seconds, then loop synth + raw guitar until Ctrl+C / 600s.
+The completed take replaces ./guitar-loop.csd; no input audio is recorded."))
+
+(defn gate-option? [arg]
+  (String.starts-with? arg "--gate="))
+
+(defn parse-options [args]
+  (let [gates (Array.copy-filter &gate-option? args)
+        devices (Array.copy-filter &(fn [arg] (not (or (= arg "--check") (gate-option? arg)))) args)
+        gate (match (Array.first &gates)
+               (Maybe.Just arg) (Double.from-string &(String.suffix &arg 7))
+               (Maybe.Nothing) (Maybe.Just -44.0))
+        input (Maybe.from (Array.first &devices) @"adc2")
+        output (Maybe.from (Array.last &devices) @"dac5")]
+    (match gate
+      (Maybe.Just threshold)
+      (if (and (<= (Array.length &gates) 1) (>= threshold -90.0) (<= threshold -6.0)
+               (or (Array.empty? &devices) (= (Array.length &devices) 2))
+               (Pattern.matches? #"^adc[0-9]+$" &input)
+               (Pattern.matches? #"^dac[0-9]+$" &output))
+        (Maybe.Just (Options.init (Array.any? &(fn [arg] (= arg "--check")) args)
+                                  threshold input output))
+        (Maybe.Nothing))
+      (Maybe.Nothing) (Maybe.Nothing))))
+
+; All shell arguments are fixed or strictly validated device identifiers.
+; A quoted heredoc feeds Csound without temporary CSD files or shell expansion.
+(defn command [options]
+  (str* "exec /usr/bin/perl -e 'alarm 600; exec @ARGV or die $!' "
+        (if @(Options.check options)
+          (String.copy "csound --syntax-check-only -d -m0 -+msg_color=0")
+          (str* "csound -d -m0 -+msg_color=0 -+rtaudio=coreaudio -i"
+                (Options.input options) " -o" (Options.output options)))
+        " /dev/stdin 2>&1 <<'CARP_GUITAR_LOOP_CSD'\n" (live-document options)
+        "CARP_GUITAR_LOOP_CSD\n"))
+
+(register popen (Fn [(Ptr CChar) (Ptr CChar)] (Ptr FILE)) "popen")
+(register pclose (Fn [(Ptr FILE)] Int) "pclose")
+(register read-line (Fn [(Ptr CChar) Int (Ptr FILE)] (Ptr CChar)) "fgets")
+(register scan-note (Fn [(Ptr CChar) (Ptr CChar) &Double &Double &Int] Int) "sscanf")
+(register scan-count (Fn [(Ptr CChar) (Ptr CChar) &Int] Int) "sscanf")
+(register make-temp (Fn [(Ptr CChar)] Int) "mkstemp")
+(register fdopen (Fn [Int (Ptr CChar)] (Ptr FILE)) "fdopen")
+(register rename-file (Fn [(Ptr CChar) (Ptr CChar)] Int) "rename")
+(system-include "sys/wait.h")
+(register exited? (Fn [Int] Bool) "WIFEXITED")
+(register signaled? (Fn [Int] Bool) "WIFSIGNALED")
+(register termination-signal (Fn [Int] Int) "WTERMSIG")
+
+(defn exit-code [status]
+  (cond
+    (= status -1) 1
+    (exited? status) (System.get-exit-status status)
+    (signaled? status) (+ 128 (termination-signal status))
+    1))
+
+(defn parse-note [line]
+  (let [at 0.0 length 0.0 midi 0]
+    (if (and (= (scan-note (String.cstr line) (String.cstr "LOOP_NOTE %lf %lf %d")
+                          &at &length &midi) 3)
+             (>= at 0.0) (< at 60.0) (> length 0.0) (<= (+ at length) 60.001)
+             (>= midi 0) (<= midi 127))
+      (Maybe.Just (Note.init at length midi))
+      (Maybe.Nothing))))
+
+(defn ready-count [line]
+  (let [count 0]
+    (if (= (scan-count (String.cstr line) (String.cstr "LOOP_READY %d") &count) 1)
+      (Maybe.Just count)
+      (Maybe.Nothing))))
+
+; Only replace a previous take once all note events have arrived and the write
+; has closed successfully. mkstemp avoids clobbering a predictable temporary path.
+(defn save-recording [notes]
+  (let [path @"guitar-loop.csd.XXXXXX"
+        fd (make-temp (String.cstr &path))]
+    (if (< fd 0)
+      false
+      (let [file (fdopen fd (String.cstr "w"))]
+        (if (null? file)
+          (do (ignore (IO.Raw.close-fd fd)) (IO.Raw.unlink! &path) false)
+          (let [content (recording-document notes)
+                written (IO.Raw.fwrite &content 1 (String.length &content) file)
+                closed (IO.Raw.fclose file)]
+            (if (and (= written (String.length &content)) (= closed 0)
+                     (= (rename-file (String.cstr &path) (String.cstr "guitar-loop.csd")) 0))
+              true
+              (do (IO.Raw.unlink! &path) false))))))))
+
+(defn main []
+  (match (parse-options &(Array.rest &(Array.from-static &System.args)))
+    (Maybe.Nothing) (do (IO.errorln &(usage)) 2)
+    (Maybe.Just options)
+    (let-do [cmd (command &options)]
+      (when (not @(Options.check &options))
+        (do
+          (IO.println &(str* "Recording 60s: " (Options.input &options) " -> " (Options.output &options)
+                            "; raw stereo monitor -6 dB throughout."))
+          (IO.println "After 60s: synth guitar loops; new playing stays raw, with NO new note recording.")
+          (IO.println "Completed notes replace ./guitar-loop.csd. Ctrl+C stops; score/alarm limit 600s.")
+          (IO.println "Low volume/headphones first. Verify FX100 input; avoid feedback/direct-monitor doubling.")
+          (IO.Raw.fflush! IO.Raw.stdout)))
+      (let [pipe (popen (String.cstr &cmd) (String.cstr "r"))]
+        (if (null? pipe)
+          (do (IO.errorln "Could not start Csound.") 1)
+          (let-do [notes [] buffer (String.allocate 4096 \0) saved false failed false]
+            ; This loop only transports streaming process I/O. Musical state is
+            ; owned by Csound; score export is a pure typed collection transform.
+            (while (not (null? (read-line (String.cstr &buffer) 4096 pipe)))
+              (do
+                (IO.print &buffer)
+                (when (String.starts-with? &buffer "LOOP_NOTE ")
+                  (match (parse-note &buffer)
+                    (Maybe.Just note) (if (< (Array.length &notes) 2048)
+                                        (set! notes (Array.push-back notes note))
+                                        (set! failed true))
+                    (Maybe.Nothing) (set! failed true)))
+                (match (ready-count &buffer)
+                  (Maybe.Just count)
+                  (if (and (not saved) (not failed) (= count (Array.length &notes)))
+                    (do
+                      (set! saved (save-recording &notes))
+                      (if saved
+                        (IO.println &(str* "Saved " count " notes to ./guitar-loop.csd."))
+                        (do (set! failed true) (IO.errorln "Could not save ./guitar-loop.csd; live loop continues."))))
+                    (do (set! failed true) (IO.errorln "Incomplete recording; previous take was not replaced.")))
+                  (Maybe.Nothing) ())
+                (IO.Raw.fflush! IO.Raw.stdout)))
+            (let [read-error (IO.Raw.ferror pipe)
+                  status (exit-code (pclose pipe))]
+              (cond
+                (/= status 0) status
+                (or read-error failed) 1
+                (or @(Options.check &options) saved) 0
+                (do (IO.errorln "Recording ended before the 60-second take was complete.") 1)))))))))

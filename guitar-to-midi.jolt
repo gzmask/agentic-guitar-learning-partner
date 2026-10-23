@@ -1,0 +1,158 @@
+#!/usr/bin/env jolt
+;; Monophonic guitar pitch detector for a FLAMMA FX100 connected over USB.
+;; Run:     jolt guitar-to-midi.jolt
+;; Monitor: jolt guitar-to-midi.jolt --monitor    (low volume/headphones first)
+;; Check:   jolt guitar-to-midi.jolt --check
+;; The current FX100 CoreAudio mapping is adc2/dac4; pass replacements as args.
+
+(require '[clojure.java.shell :refer [sh]])
+(require '[clojure.string :as str])
+
+
+(def orchestra
+  "sr = 44100
+ksmps = 32
+nchnls = 2
+0dbfs = 1
+
+strset 1, \"C\"
+strset 2, \"C#\"
+strset 3, \"D\"
+strset 4, \"D#\"
+strset 5, \"E\"
+strset 6, \"F\"
+strset 7, \"F#\"
+strset 8, \"G\"
+strset 9, \"G#\"
+strset 10, \"A\"
+strset 11, \"A#\"
+strset 12, \"B\"
+
+instr 1
+  aleft, aright ins
+  ain = (aleft + aright) * 0.5
+  kfreq, kdb ptrack ain, 1024
+  kmidi = round(69 + 12 * log(kfreq / 440) / log(2))
+
+  kgate init 0
+  kcandidate init -1
+  kactive init -1
+  kstable init 0
+  ksilent init 0
+
+  ; Hysteresis prevents a decaying note from repeatedly opening the gate.
+  if kgate == 0 then
+    if kdb > -36 then
+      kgate = 1
+    endif
+  elseif kdb < -42 then
+    kgate = 0
+  endif
+
+  kvalid = 0
+  if kgate == 1 && kfreq >= 70 && kfreq <= 1400 then
+    kvalid = 1
+  endif
+  if kvalid == 1 then
+    ksilent = 0
+    if kmidi != kcandidate then
+      kcandidate = kmidi
+      kstable = 0
+    else
+      kstable = kstable + ksmps / sr
+    endif
+
+    ; Require a stable pitch for 55 ms before accepting a new note.
+    if kstable >= 0.055 && kcandidate != kactive then
+      event \"i\", 2, 0, 0.01, kcandidate, kfreq, kdb
+      kactive = kcandidate
+    endif
+  else
+    kcandidate = -1
+    kstable = 0
+    ksilent = ksilent + ksmps / sr
+    ; Allow the same note to be reported again after a real release.
+    if ksilent >= 0.12 then
+      kactive = -1
+    endif
+  endif
+
+  ; Monitoring is independent of pitch/gate decisions; retain the stereo input.
+  ; p4 is 0 (silent) or 0.5 (-6 dB). No synthesis or MIDI audio is added.
+  outs aleft * p4, aright * p4
+endin
+
+instr 2
+  imidi = i(p4)
+  ifreq = i(p5)
+  idb = i(p6)
+  inote = imidi % 12
+  ioctave = int(imidi / 12) - 1
+  Sname strget inote + 1
+  printf_i \"MIDI %d  %s%d  %.2f Hz  %.1f dBFS\\n\", 1, imidi, Sname, ioctave, ifreq, idb
+endin
+")
+
+
+(defn csound-document
+  [monitor?]
+  (str "<CsoundSynthesizer>\n<CsInstruments>\n" orchestra
+       "</CsInstruments>\n<CsScore>\ni 1 0 600 " (if monitor? 0.5 0) "\ne\n"
+       "</CsScore>\n</CsoundSynthesizer>\n"))
+
+
+(def usage
+  "Usage: jolt guitar-to-midi.jolt [--monitor] [adcN dacN]\n       jolt guitar-to-midi.jolt --check [--monitor]")
+
+
+(defn parse-options
+  [args]
+  (let [devices (vec (remove #{"--monitor" "--check"} args))
+        [input output] (if (empty? devices) ["adc2" "dac4"] devices)]
+    (when-not (and (or (empty? devices) (= 2 (count devices)))
+                   (re-matches #"adc[0-9]+" input)
+                   (re-matches #"dac[0-9]+" output))
+      (throw (ex-info usage {})))
+    {:check? (boolean (some #{"--check"} args))
+     :monitor? (boolean (some #{"--monitor"} args))
+     :input input
+     :output output}))
+
+
+(defn fail
+  [message]
+  (binding [*out* *err*]
+    (println message))
+  (System/exit 2))
+
+
+(let [{:keys [check? monitor? input output]}
+      (try
+        (parse-options *command-line-args*)
+        (catch Exception error
+          (fail (ex-message error))))
+      command
+      (if check?
+        ["csound" "--syntax-check-only" "-d" "-m0" "/dev/stdin"]
+        ["/usr/bin/perl" "-e"
+         (str "if (open(TTY, q(>), q(/dev/tty))) { "
+              "open(STDOUT, q(>&), TTY); open(STDERR, q(>&), TTY); } "
+              "alarm 600; exec @ARGV or die $!")
+         "csound" "-d" "-m0" "-+rtaudio=coreaudio"
+         (str "-i" input) (str "-o" output) "/dev/stdin"])]
+  (when-not check?
+    (println (str "Listening on " input "; "
+                  (if monitor? "monitoring at -6 dB on " "silent output on ") output "."))
+    (when monitor?
+      (println "Use headphones/low volume. Disable duplicate FX100 direct monitoring."))
+    (println "Play one note at a time. Ctrl+C stops.")
+    (println "Console format: MIDI number, note name, frequency, level")
+    (flush))
+  (let [{:keys [exit out err]} (apply sh (concat command [:in (csound-document monitor?)]))]
+    (when check?
+      (print out))
+    (when-not (str/blank? err)
+      (binding [*out* *err*]
+        (print err)))
+    (when-not (zero? exit)
+      (System/exit exit))))

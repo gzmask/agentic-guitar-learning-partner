@@ -1,0 +1,217 @@
+; Monophonic FX100 pitch tracking using Csound AMDF (not ptrack).
+; Build: carp -b guitar-pitchamdf.carp
+; Run: "${TMPDIR:-/tmp}/carp-guitar-pitchamdf/guitar-pitchamdf" --monitor adc2 dac5
+; Add --raw for 10 Hz estimates, or --gate=-48 for a quieter input.
+; --check opens no audio devices. Ctrl+C stops; safety limit is 600 seconds.
+; Requires Carp, a C compiler, Csound and system Perl. Build files stay in temp.
+
+(Project.config "title" "guitar-pitchamdf")
+(Project.config "output-directory"
+  (str (if (Dynamic.nil? (get-env "TMPDIR")) "/tmp" (get-env "TMPDIR"))
+       "/carp-guitar-pitchamdf"))
+
+(deftype Options [check Bool monitor Bool raw Bool gate Double input String output String])
+
+; Kept identical to guitar-pitchamdf.jolt; Csound does the pitch detection.
+(defn orchestra []
+  (String.copy "sr = 44100
+ksmps = 32
+nchnls = 2
+0dbfs = 1
+
+strset 1, \"C\"
+strset 2, \"C#\"
+strset 3, \"D\"
+strset 4, \"D#\"
+strset 5, \"E\"
+strset 6, \"F\"
+strset 7, \"F#\"
+strset 8, \"G\"
+strset 9, \"G#\"
+strset 10, \"A\"
+strset 11, \"A#\"
+strset 12, \"B\"
+
+instr 1
+  aleft, aright ins
+  ain = (aleft + aright) * 0.5
+  ; min/max Hz, initial estimate=auto, pitch median=off, downsample=1,
+  ; native analysis rate (iexcps=0), RMS median=off. No prefilter or song knowledge.
+  kfreq, krms pitchamdf ain, 70, 1400, 0, 0, 1, 0, 0
+  kdb = 20 * log10(max(krms, 0.000000001))
+  kpitch = 69 + 12 * log(max(kfreq, 0.000000001) / 440) / log(2)
+  kmidi = round(kpitch)
+  kcents = 100 * (kpitch - kmidi)
+  ktime timeinsts
+
+  kgate init 0
+  kcandidate init -1
+  kactive init -1
+  kstable init 0
+  ksilent init 0
+
+  ; p6 is the opening RMS threshold; close 6 dB below it.
+  if kgate == 0 then
+    if kdb > p6 then
+      kgate = 1
+    endif
+  elseif kdb < p6 - 6 then
+    kgate = 0
+  endif
+
+  kvalid = 0
+  if kgate == 1 && kfreq >= 70 && kfreq <= 1400 then
+    kvalid = 1
+  endif
+  if kvalid == 1 then
+    ksilent = 0
+    if kmidi != kcandidate then
+      kcandidate = kmidi
+      kstable = 0
+    else
+      kstable = kstable + ksmps / sr
+    endif
+    if kstable >= 0.055 && kcandidate != kactive then
+      if p5 == 0 then
+        event \"i\", 2, 0, 0.01, kcandidate, kfreq, kdb, ktime, kcents
+      endif
+      kactive = kcandidate
+    endif
+  else
+    kcandidate = -1
+    kstable = 0
+    ksilent = ksilent + ksmps / sr
+    if ksilent >= 0.12 then
+      kactive = -1
+    endif
+  endif
+
+  ; Raw mode bypasses note confirmation, but still marks gated estimates invalid.
+  kreport metro 10
+  if p5 == 1 && kreport == 1 then
+    if kvalid == 1 then
+      event \"i\", 3, 0, 0.01, kmidi, kfreq, kdb, ktime, kcents
+    else
+      printks \"RAW t=%.3fs MIDI -- note=-- %.2f Hz RMS %.1f dBFS (gated/invalid)\\n\", 0, ktime, kfreq, kdb
+    endif
+  endif
+
+  ; Independent stereo monitoring at -6 dB when enabled; otherwise silent.
+  outs aleft * p4, aright * p4
+endin
+
+instr 2, 3
+  imidi = i(p4)
+  ioctave = int(imidi / 12) - 1
+  Sname strget (imidi % 12) + 1
+  if p1 == 3 then
+    prints \"RAW \"
+  endif
+  printf_i \"t=%.3fs MIDI %d %s%d %.2f Hz %+.1f cents RMS %.1f dBFS\\n\", 1, p7, imidi, Sname, ioctave, p5, p8, p6
+endin
+"))
+
+(defn usage []
+  (String.copy "Usage: guitar-pitchamdf [--monitor] [--raw] [--gate=-44] [adcN dacN]
+       guitar-pitchamdf --check
+Default: adc2/dac4, silent output, RMS gate -44/-50 dBFS."))
+
+(defn flag? [arg]
+  (or (= arg "--monitor") (= arg "--raw") (= arg "--check")))
+
+(defn gate-option? [arg]
+  (String.starts-with? arg "--gate="))
+
+(defn has-option? [args flag]
+  (Array.any? &(fn [arg] (= arg flag)) args))
+
+; Pure parsing: validate devices before including them in the shell command.
+(defn parse-options [args]
+  (let [gate-args (Array.copy-filter &gate-option? args)
+        devices (Array.copy-filter &(fn [arg] (not (or (flag? arg) (gate-option? arg)))) args)
+        gate (match (Array.first &gate-args)
+               (Maybe.Just arg) (Double.from-string &(String.suffix &arg 7))
+               (Maybe.Nothing) (Maybe.Just -44.0))
+        input (Maybe.from (Array.first &devices) @"adc2")
+        output (Maybe.from (Array.last &devices) @"dac4")]
+    (match gate
+      (Maybe.Just threshold)
+      (if (and (<= (Array.length &gate-args) 1)
+               (>= threshold -90.0) (<= threshold -6.0)
+               (or (Array.empty? &devices) (= (Array.length &devices) 2))
+               (Pattern.matches? #"^adc[0-9]+$" &input)
+               (Pattern.matches? #"^dac[0-9]+$" &output))
+        (Maybe.Just (Options.init (has-option? args "--check")
+                                  (has-option? args "--monitor")
+                                  (has-option? args "--raw") threshold input output))
+        (Maybe.Nothing))
+      (Maybe.Nothing) (Maybe.Nothing))))
+
+(defn csound-document [options]
+  (str* "<CsoundSynthesizer>\n<CsInstruments>\n" (orchestra)
+        "</CsInstruments>\n<CsScore>\ni 1 0 600 "
+        (if @(Options.monitor options) "0.5" "0") " "
+        (if @(Options.raw options) "1" "0") " " @(Options.gate options) "\ne\n"
+        "</CsScore>\n</CsoundSynthesizer>\n"))
+
+(defn command [options]
+  (if @(Options.check options)
+    (String.copy "exec csound --syntax-check-only -d -m0 /dev/stdin")
+    ; exec keeps the child in our foreground process group; no daemon or capture.
+    ; Devices are strictly adc/dac plus digits, never arbitrary shell text.
+    (str* "exec /usr/bin/perl -e 'alarm 600; exec @ARGV or die $!' "
+          "csound -d -m0 -+rtaudio=coreaudio -i" (Options.input options)
+          " -o" (Options.output options) " /dev/stdin")))
+
+(register popen (Fn [(Ptr CChar) (Ptr CChar)] (Ptr FILE)) "popen")
+(register pclose (Fn [(Ptr FILE)] Int) "pclose")
+(system-include "sys/wait.h")
+(register exited? (Fn [Int] Bool) "WIFEXITED")
+(register signaled? (Fn [Int] Bool) "WIFSIGNALED")
+(register termination-signal (Fn [Int] Int) "WTERMSIG")
+(system-include "signal.h")
+(register signal-pipe Int "SIGPIPE")
+(defn ignore-broken-pipe [signal-number] ())
+
+(defn exit-code [status]
+  (cond
+    (= status -1) 1
+    (exited? status) (System.get-exit-status status)
+    (signaled? status) (+ 128 (termination-signal status))
+    1))
+
+(defn announce [options]
+  (do
+    (IO.println &(str* "pitchamdf: " (Options.input options) " -> " (Options.output options) "; "
+                      (if @(Options.monitor options) "monitor -6 dB" "silent output") "."))
+    (IO.println "AMDF: 70..1400 Hz, native analysis rate, median filters off, no downsampling.")
+    (IO.println &(str* "RMS gate " @(Options.gate options) "/" (- @(Options.gate options) 6.0)
+                      " dBFS; " (if @(Options.raw options)
+                                  "raw estimates at 10 Hz."
+                                  "55 ms stable pitch, 120 ms release.")))
+    (IO.println "MIDI number, note/octave (C4=60), Hz, cents, AMDF RMS. No MIDI messages sent.")
+    (IO.println "Foreground only. Ctrl+C stops; score/alarm cap runtime at 600 seconds.")
+    (when @(Options.monitor options)
+      (IO.println "Use headphones/low volume; avoid duplicate direct monitoring or feedback."))
+    (IO.Raw.fflush! IO.Raw.stdout)))
+
+(defn main []
+  (match (parse-options &(Array.rest &(Array.from-static &System.args)))
+    (Maybe.Nothing) (do (IO.errorln &(usage)) 2)
+    (Maybe.Just options)
+    (let-do [document (csound-document &options)
+             cmd (command &options)]
+      (when (not @(Options.check &options)) (announce &options))
+      ; An early engine failure must reach pclose, not kill us with SIGPIPE.
+      (System.signal signal-pipe ignore-broken-pipe)
+      (let [pipe (popen (String.cstr &cmd) (String.cstr "w"))]
+        (if (null? pipe)
+          (do (IO.errorln "Could not start Csound.") 1)
+          (let [written (IO.Raw.fwrite &document 1 (String.length &document) pipe)
+                flushed (IO.Raw.fflush pipe)
+                status (exit-code (pclose pipe))]
+            (cond
+              (/= status 0) status
+              (or (/= written (String.length &document)) (/= flushed 0))
+              (do (IO.errorln "Could not send the complete Csound document.") 1)
+              0)))))))
