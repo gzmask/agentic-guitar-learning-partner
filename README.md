@@ -242,6 +242,35 @@ alarm limit the whole session (idle + recording + playback) to 600 seconds.
 Jolt handles configuration and process launch; Csound handles the real-time
 state machine and DSP. The existing scripts and song implementations are unchanged.
 
+## Guitar-controlled note looper (JVM Clojure + Tartini)
+
+`guitar_gesture_looper.clj` implements the same three guitar-note commands as
+the Jolt gesture looper, but uses SuperCollider's `Tartini.kr` for monophonic
+pitch detection. Clojure owns the note filter and state machine; SuperCollider
+handles raw monitoring and the synthesized loop. It requires Overtone and the
+`PitchDetection` sc3-plugin described in the next section.
+
+```bash
+clojure -Sdeps '{:deps {overtone/overtone {:mvn/version "0.16.3331"}}}' \
+  -M guitar_gesture_looper.clj --check
+
+clojure -Sdeps '{:deps {overtone/overtone {:mvn/version "0.16.3331"}}}' \
+  -M guitar_gesture_looper.clj --input Fx100 --output Fx100
+```
+
+`--check` verifies the pure state machine and compiles the Tartini, voice, and
+mixer graphs without opening audio devices. Live device values are
+SuperCollider/CoreAudio names, not Csound `adcN`/`dacN` identifiers. Override
+the default -44/-50 dBFS gate with, for example, `--gate=-48`.
+
+The commands, four-second command window, command-note exclusion, 55 ms pitch
+confirmation, 120 ms release, in-memory note capture, raw -6 dB monitoring, and
+600-second foreground safety limit match the Jolt version. Tartini runs with
+threshold 0.93, N=2048, k=1024, overlap=1024; confidence must exceed 0.9. Loop
+notes are sent back to SuperCollider as timestamped synth events, while new
+guitar playing remains raw and is never overdubbed. Use low volume/headphones,
+avoid direct-monitor doubling, and press Ctrl+C to stop.
+
 ## Same-recording pitch comparison
 
 `guitar_pitch.clj` is a separate JVM Clojure/Overtone experiment. Its fair
