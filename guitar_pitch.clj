@@ -1,7 +1,8 @@
 ;; JVM Clojure + Overtone / SuperCollider Pitch.kr, separate from the song POC.
 ;; clojure -Sdeps '{:deps {overtone/overtone {:mvn/version "0.16.3331"}}}' -M guitar_pitch.clj [--monitor]
 ;; --check compiles the graph without opening audio or starting scsynth.
-;; --compare recording.wav compares both trackers offline; requires ffmpeg + csound.
+;; --compare recording.wav compares four trackers offline; requires ffmpeg + csound
+;; and the sc3-plugins PitchDetection extension.
 
 (ns guitar-pitch
   (:require
@@ -9,6 +10,7 @@
     [overtone.osc :as osc]
     [overtone.osc.encode :as osc-encode]
     [overtone.sc.machinery.synthdef :as synthdef]
+    [overtone.sc.machinery.ugen.fn-gen :as fn-gen]
     [overtone.sc.synth :refer [defsynth]]
     [overtone.sc.ugens :as u])
   (:import
@@ -19,6 +21,16 @@
     (java.util.concurrent
       LinkedBlockingQueue
       TimeUnit)))
+
+
+(def tartini-spec
+  ;; Tartini is supplied by sc3-plugins rather than Overtone's UGen metadata.
+  {:name "Tartini" :num-outs 2})
+
+
+(defn tartini:kr
+  [in]
+  (fn-gen/mk-scugen tartini-spec :kr 0 [in 0.93 2048 0 1024 0.5]))
 
 
 ;; Defining the graph does not boot a server. In:ar starts after output buses.
@@ -96,14 +108,19 @@
    :last-time -1.0 :event nil})
 
 
+(defn valid-pitch?
+  [{:keys [has-freq validity-threshold]}]
+  (> has-freq (or validity-threshold 0.5)))
+
+
 (defn track-note
   "Pure note filter driven by synth time, not OSC arrival or JVM scheduling time."
   [{:keys [gate? candidate active since silent-since last-time] :as state}
-   {:keys [time hz db has-freq] :as sample}]
+   {:keys [time hz db] :as sample}]
   (if (<= time last-time)
     (assoc state :event nil)
     (let [gate? (> db (if gate? -42.0 -36.0))
-          label (when (and gate? (> has-freq 0.5)) (pitch-label hz))
+          label (when (and gate? (valid-pitch? sample)) (pitch-label hz))
           state (assoc state :last-time time :gate? gate? :event nil)]
       (if-let [midi (:midi label)]
         (let [since (if (or (not= midi candidate) (> (- time last-time) 0.05)) time since)
@@ -244,17 +261,18 @@
           (catch IllegalStateException _))))))
 
 
-;; Offline comparison: both engines consume one normalized mono WAV. Only their
-;; frequency/validity outputs differ; RMS, time grid, gating and note filtering
+;; Offline comparison: both engines consume one normalized mono WAV. Only the
+;; four trackers' frequency/validity outputs differ; RMS, time grid, gating and note filtering
 ;; are computed once here. No audio devices or OSC server are opened.
 ^{:clj-kondo/ignore [:unresolved-symbol]}
 (defsynth offline-pitch []
   (let [mono (u/in:ar (u/num-output-buses:ir) 1)
-        [hz valid] (u/pitch:kr mono :init-freq 440 :min-freq 70 :max-freq 1400
-                               :exec-freq 100 :max-bins-per-octave 64 :median 1
-                               :amp-threshold 0)]
+        [pitch-hz pitch-valid] (u/pitch:kr mono :init-freq 440 :min-freq 70 :max-freq 1400
+                                           :exec-freq 100 :max-bins-per-octave 64 :median 1
+                                           :amp-threshold 0)
+        [tartini-hz tartini-confidence] (tartini:kr mono)]
     ;; Control-rate recording avoids K2A interpolation of raw pitch estimates.
-    (u/record-buf:kr [hz valid] 0 :loop 0)))
+    (u/record-buf:kr [pitch-hz pitch-valid tartini-hz tartini-confidence] 0 :loop 0)))
 
 
 (defn run-offline!
@@ -318,7 +336,8 @@
   (let [spawn (osc-bytes (osc/osc-msg "/s_new" (:name (:sdef offline-pitch))
                                       (int 1000) (int 0) (int 0)))
         load (osc-bytes (osc/osc-msg "/d_recv" (synthdef/synthdef-bytes (:sdef offline-pitch)) spawn))
-        score [[0.0 [(osc/osc-msg "/b_alloc" (int 0) (int blocks) (int 2) load)]]
+        channels 4
+        score [[0.0 [(osc/osc-msg "/b_alloc" (int 0) (int blocks) (int channels) load)]]
                [duration [(osc/osc-msg "/n_free" (int 1000))
                           (osc/osc-msg "/b_write" (int 0) (str result-file) "wav" "float"
                                        (int -1) (int 0) (int 0))]]
@@ -332,49 +351,64 @@
           (.write stream ^bytes bytes))))))
 
 
-(defn ptrack-document
+(defn csound-trackers-document
   [duration]
   (str "<CsoundSynthesizer>\n<CsInstruments>\n"
-       "sr=44100\nksmps=32\nnchnls=2\nnchnls_i=1\n0dbfs=1\n"
-       "instr 1\n ain inch 1\n khz,kignored ptrack ain,1024\n"
-       " kvalid = (khz >= 70 && khz <= 1400 ? 1 : 0)\n"
-       ;; Scale the numeric telemetry below full scale; it is not audio.
-       " afreq upsamp khz/2000\n avalid upsamp kvalid\n outs afreq,avalid\nendin\n"
+       "sr=44100\nksmps=32\nnchnls=4\nnchnls_i=1\n0dbfs=1\n"
+       "instr 1\n ain inch 1\n"
+       " kptrack,kignored ptrack ain,1024\n"
+       " kamdf,kamdfrms pitchamdf ain,70,1400,0,0,1,0,0\n"
+       " kptrackvalid = (kptrack >= 70 && kptrack <= 1400 ? 1 : 0)\n"
+       " kamdfvalid = (kamdf >= 70 && kamdf <= 1400 ? 1 : 0)\n"
+       ;; Scale numeric telemetry; it is not audio and the shared gate ignores kamdfrms.
+       " aptrack upsamp kptrack/2000\n aptrackvalid upsamp kptrackvalid\n"
+       " aamdf upsamp kamdf/2000\n aamdfvalid upsamp kamdfvalid\n"
+       " outq aptrack,aptrackvalid,aamdf,aamdfvalid\nendin\n"
        "</CsInstruments>\n<CsScore>\ni 1 0 " duration "\ne\n</CsScore>\n</CsoundSynthesizer>\n"))
 
 
 (defn compare-traces
-  "Return aligned rows with identical source-time/RMS input to both filters."
-  [source ptrack pitch]
+  "Return aligned rows with identical source-time/RMS input to all filters."
+  [source csound pitch]
   (let [^java.nio.FloatBuffer audio (:data source)
-        ^java.nio.FloatBuffer p (:data ptrack)
+        ^java.nio.FloatBuffer c (:data csound)
         ^java.nio.FloatBuffer s (:data pitch)
         frames (:frames source)]
-    (when-not (and (= 1 (:channels source)) (= 2 (:channels ptrack) (:channels pitch))
-                   (>= (:frames ptrack) frames)
+    (when-not (and (= 1 (:channels source)) (= 4 (:channels csound)) (= 4 (:channels pitch))
+                   (>= (:frames csound) frames)
                    (>= (:frames pitch) (quot (+ frames 31) 32)))
-      (throw (ex-info "Offline engines returned incomplete or misaligned traces." {})))
+      (throw (ex-info (str "Offline engines returned incomplete or misaligned traces: "
+                           "source=" (select-keys source [:frames :channels]) ", "
+                           "csound=" (select-keys csound [:frames :channels]) ", "
+                           "Pitch/Tartini=" (select-keys pitch [:frames :channels]) ".") {})))
     (:rows
       (reduce
         (fn [{:keys [states rows]} frame]
           (let [block (quot frame 32)
                 end-frame (min frames (* (inc block) 32))
                 base {:time (/ end-frame 44100.0) :db (rms-db audio end-frame)}
-                inputs [(assoc base :hz (* 2000.0 (.get p (int (* block 64))))
-                               :has-freq (double (.get p (int (inc (* block 64))))))
-                        (assoc base :hz (double (.get s (int (* block 2))))
-                               :has-freq (double (.get s (int (inc (* block 2))))))]
+                csound-offset (* block 128)
+                pitch-offset (* block 4)
+                inputs [(assoc base :hz (* 2000.0 (.get c (int csound-offset)))
+                               :has-freq (double (.get c (int (inc csound-offset)))))
+                        (assoc base :hz (* 2000.0 (.get c (int (+ csound-offset 2))))
+                               :has-freq (double (.get c (int (+ csound-offset 3)))))
+                        (assoc base :hz (double (.get s (int pitch-offset)))
+                               :has-freq (double (.get s (int (inc pitch-offset)))))
+                        (assoc base :hz (double (.get s (int (+ pitch-offset 2))))
+                               :has-freq (double (.get s (int (+ pitch-offset 3))))
+                               :validity-threshold 0.9)]
                 states (mapv track-note states inputs)]
             {:states states
              :rows (conj rows (assoc base :inputs inputs :states states))}))
-        {:states [initial-state initial-state] :rows []}
+        {:states [initial-state initial-state initial-state initial-state] :rows []}
         (range 0 frames 441)))))
 
 
 (defn comparison-cell
-  [{:keys [hz has-freq]} {:keys [event]}]
-  (let [label (when (> has-freq 0.5) (pitch-label hz))]
-    (String/format Locale/ROOT "%8.2f Hz %-3s valid=%.0f new=%-3s"
+  [{:keys [hz has-freq] :as input} {:keys [event]}]
+  (let [label (when (valid-pitch? input) (pitch-label hz))]
+    (String/format Locale/ROOT "%8.2f Hz %-3s validity=%.2f new=%-3s"
                    (to-array [hz (or (:note label) "--") has-freq (or (:note event) "--")]))))
 
 
@@ -382,11 +416,15 @@
   [rows raw?]
   (doseq [{:keys [time db inputs states]} rows
           :when (or raw? (some :event states))]
-    (println (String/format Locale/ROOT "t=%7.3fs RMS=%6.1f dBFS | ptrack %s | Pitch.kr %s"
-                            (to-array [time db (comparison-cell (first inputs) (first states))
-                                       (comparison-cell (second inputs) (second states))]))))
+    (println (String/format Locale/ROOT
+                            "t=%7.3fs RMS=%6.1f dBFS | ptrack %s | pitchamdf %s | Pitch.kr %s | Tartini.kr %s"
+                            (to-array [time db
+                                       (comparison-cell (first inputs) (first states))
+                                       (comparison-cell (second inputs) (second states))
+                                       (comparison-cell (nth inputs 2) (nth states 2))
+                                       (comparison-cell (nth inputs 3) (nth states 3))]))))
   (println "Accepted MIDI sequences:")
-  (doseq [[index name] [[0 "ptrack"] [1 "Pitch.kr"]]]
+  (doseq [[index name] [[0 "ptrack"] [1 "pitchamdf"] [2 "Pitch.kr"] [3 "Tartini.kr"]]]
     (println name (vec (keep #(get-in % [:states index :event :midi]) rows))))
   (println "Event counts are NOT accuracy. Audio-time confirmations are NOT hardware round-trip latency."))
 
@@ -403,8 +441,10 @@
         (throw (ex-info "Comparison accepts mono or stereo WAV input only." {})))
       (println "Offline comparison: same mono WAV, 44.1 kHz, 32-sample blocks, 100 Hz reporting.")
       (println "Shared: trailing 1024-sample RMS, -36/-42 dBFS gate, 55 ms stable, 120 ms release.")
-      (println "ptrack: hop=1024; Pitch.kr: 70..1400 Hz, exec=100 Hz, bins=64, median=1, ampThreshold=0.")
-      (println "Raw Pitch.kr validity is respected; its amplitude gate is disabled. No audio devices are opened.")
+      (println "ptrack: hop=1024; pitchamdf: 70..1400 Hz, native analysis rate, median=0, downsample=1.")
+      (println "Pitch.kr: 70..1400 Hz, exec=100 Hz, bins=64, median=1, ampThreshold=0.")
+      (println "Tartini.kr: threshold=0.93, N=2048, k=1024, overlap=1024, confidence>0.9; requires sc3-plugins.")
+      (println "pitchamdf RMS is ignored; raw Pitch.kr validity is respected. No audio devices are opened.")
       (flush)
       (run-offline! ["ffmpeg" "-nostdin" "-y" "-v" "error" "-i" (.getAbsolutePath source)
                      "-map" "0:a:0" "-af" (if (= 2 channels) "pan=mono|c0=0.5*c0+0.5*c1" "anull")
@@ -416,15 +456,15 @@
         (when-not (< 0 frames (* 600 44100))
           (throw (ex-info "Comparison WAV must be nonempty and shorter than 600 seconds." {})))
         (write-nrt! (file "pitch.osc") blocks duration (file "pitch.wav"))
-        (spit (file "ptrack.csd") (ptrack-document duration))
+        (spit (file "csound.csd") (csound-trackers-document duration))
         (run-offline! [(scsynth-path) "-N" (str (file "pitch.osc")) (str (file "mono.wav"))
                        (str (file "silent.wav")) "44100" "WAV" "float"
                        "-i" "1" "-o" "1" "-z" "32" "-D" "0" "-R" "0"]
                       (file "pitch.log"))
         (run-offline! ["csound" "-d" "-m0" "-W" "-f" "-i" (str (file "mono.wav"))
-                       "-o" (str (file "ptrack.wav")) (str (file "ptrack.csd"))]
-                      (file "ptrack.log"))
-        (print-comparison! (compare-traces audio (float-wav (file "ptrack.wav"))
+                       "-o" (str (file "csound.wav")) (str (file "csound.csd"))]
+                      (file "csound.log"))
+        (print-comparison! (compare-traces audio (float-wav (file "csound.wav"))
                                            (float-wav (file "pitch.wav"))) raw?)
         (println "Finished normally: both engines reached the same WAV ending."))
       (finally
@@ -440,7 +480,7 @@
       check? (do
                (synthdef/synthdef-bytes (:sdef guitar-detector))
                (synthdef/synthdef-bytes (:sdef offline-pitch))
-               (println "Live and offline Pitch.kr graphs compiled; no audio devices opened."))
+               (println "Pitch.kr and Tartini.kr graphs compiled; no audio devices opened."))
       compare (compare-file! options)
       :else (do
               (listen! options)

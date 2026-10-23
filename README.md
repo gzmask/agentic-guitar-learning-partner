@@ -140,7 +140,7 @@ live script's settings. Override its opening threshold with `--gate=-48` (the
 closing threshold stays 6 dB lower). `--raw` bypasses note confirmation, not the
 gate; closed-gate/out-of-range estimates display `note=--` with their Hz/level.
 AMDF's RMS is not `ptrack`'s spectral dB estimate: this live script is for
-subjective evaluation, not a calibrated three-algorithm benchmark.
+subjective evaluation, not the calibrated same-recording comparison below.
 
 `--monitor` passes stereo input through at -6 dB independently of detection.
 Use headphones/low volume, verify device numbers, and avoid duplicate monitoring
@@ -245,10 +245,15 @@ state machine and DSP. The existing scripts and song implementations are unchang
 ## Same-recording pitch comparison
 
 `guitar_pitch.clj` is a separate JVM Clojure/Overtone experiment. Its fair
-comparison mode runs Csound `ptrack` and SuperCollider `Pitch.kr` **offline on
-one recording**, rather than comparing two different performances or audio
-output devices. Requires Clojure, SuperCollider, Csound, and FFmpeg. No project
-dependency manifest or persistent server is needed.
+comparison mode runs Csound `ptrack` and `pitchamdf` plus SuperCollider
+`Pitch.kr` and `Tartini.kr` **offline on one recording**, rather than comparing
+different performances or audio output devices. Requires Clojure, SuperCollider,
+Csound, FFmpeg, and the `PitchDetection` extension from the matching
+[sc3-plugins release](https://github.com/supercollider/sc3-plugins/releases).
+For SuperCollider 3.14.1, copy the `PitchDetection` directory from
+`sc3-plugins-3.14.1-macOS.zip` into
+`~/Library/Application Support/SuperCollider/Extensions/`. No project dependency
+manifest or persistent server is needed.
 
 Record a clean, single-note passage with your DAW, or capture 30 seconds from
 FX100 without playback (run this yourself when ready to play):
@@ -264,30 +269,34 @@ clojure -Sdeps '{:deps {overtone/overtone {:mvn/version "0.16.3331"}}}' \
   -M guitar_pitch.clj --compare /tmp/guitar.wav
 ```
 
-Both engines receive the exact same float32 mono WAV at 44.1 kHz (stereo is
-averaged as `(L + R) / 2`), with 32-sample control blocks. The Clojure layer
-samples both traces on the same 100 Hz audio-time grid and supplies **one shared
+All four trackers receive the exact same float32 mono WAV at 44.1 kHz (stereo
+is averaged as `(L + R) / 2`), with 32-sample control blocks. The Clojure layer
+samples all traces on the same 100 Hz audio-time grid and supplies **one shared
 1024-sample trailing RMS calculation**, -36/-42 dBFS gate, 55 ms note confirmation,
-and 120 ms release. Neither engine's own amplitude estimate controls this gate.
-Pitch.kr's separate amplitude threshold is disabled; its intrinsic `hasFreq`
-validity is still respected. Parameters are printed: `ptrack` hop=1024;
-`Pitch.kr` 70–1400 Hz, exec=100 Hz, bins/octave=64, median=1. This compares these
-explicit configurations, not a claim about their default settings.
+and 120 ms release. No tracker's own amplitude estimate controls this gate;
+`pitchamdf`'s RMS output is deliberately ignored. Pitch.kr's separate amplitude
+threshold is disabled; its intrinsic `hasFreq` validity is still respected.
+Tartini uses its confidence output with a `>0.9` validity threshold. Parameters
+are printed: `ptrack` hop=1024; `pitchamdf` 70–1400 Hz, native analysis rate,
+median=0, downsample=1; `Pitch.kr` 70–1400 Hz, exec=100 Hz, bins/octave=64,
+median=1; Tartini threshold=0.93, N=2048, k=1024, overlap=1024. This compares
+these explicit configurations, not a claim about their default settings.
 
-Each row shows the shared timestamp/RMS, both raw pitch estimates, and newly
-confirmed notes (`new=`). Add `--raw` to print every analysis row, including
-invalid/silent estimates. The final MIDI sequences help locate disagreements;
-event counts alone are **not accuracy scores**, and audio-time confirmation
-positions are **not hardware round-trip latency measurements**. Accuracy needs
-known notes/onsets; live latency needs a separate measurement.
+Each row shows the shared timestamp/RMS and all four raw pitch estimates and
+newly confirmed notes (`new=`). Add `--raw` to print every analysis row,
+including invalid/silent estimates. The final MIDI sequences help locate
+disagreements; event counts alone are **not accuracy scores**, and audio-time
+confirmation positions are **not hardware round-trip latency measurements**.
+Accuracy needs known notes/onsets; live latency needs a separate measurement.
 
 The comparison opens no audio devices, ends at the recording's ending (maximum
 length less than 600 seconds), and deletes its temporary files. Ctrl+C stops the
-owned foreground child; each child also has a 600-second wall-clock alarm.
-The existing standalone live scripts remain useful for trying the input, but
-are **not** the calibrated comparison. `guitar_pitch.clj --check` checks both
-Overtone graphs without opening audio. Live mode still defaults to 60 seconds
-and now prints an explicit normal-ending message.
+owned foreground child; each child also has a 600-second wall-clock alarm. The
+existing standalone live scripts remain useful for trying the input, but are
+**not** the calibrated comparison. `guitar_pitch.clj --check` compiles the
+Pitch.kr and Tartini graphs without opening audio; only `--compare` verifies
+that the external Tartini server plugin is installed. Live mode still uses
+Pitch.kr, defaults to 60 seconds, and prints an explicit normal-ending message.
 
 ## What is being compared?
 
