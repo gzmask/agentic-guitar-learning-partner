@@ -38,6 +38,64 @@ until this plan is implemented and verified. In particular, `song.carp` and
 - Persistent project/session management.
 - Editing arbitrary regions from a recorded waveform.
 
+## Selected implementation stack
+
+The first implementation uses **Jolt as the application host and Csound 6 as an
+embedded audio engine through the native C API**:
+
+```text
+Jolt
+├── startup and device selection
+├── scale/wake configuration
+├── pure command reducer and looper policy
+├── voice-prompt coordination
+├── terminal dashboard and event log
+└── jolt.ffi adapter to libcsound
+
+Csound 6.18
+├── CoreAudio input/output
+├── pitchamdf, RMS gate, and sample clock
+├── stereo PCM recording tables
+├── loop playback, crossfades, and mixing
+└── prompt-buffer playback
+```
+
+This is deliberately **not** the current one-shot
+`clojure.java.shell/sh -> csound` pattern. The live engine must not be a blocking
+subprocess whose command state is hidden inside its orchestra. Jolt owns semantic
+state and policy; Csound owns sample-accurate DSP and buffers.
+
+The initial integration rules are:
+
+- Load the Csound framework directly with `jolt.ffi` and isolate every native
+  binding in one adapter namespace/file.
+- Detect and validate the Csound API version at startup. The target is Csound
+  6.18; Csound 7 is a separate compatibility effort because major API versions
+  are not assumed compatible.
+- Pin a supported Jolt version before implementation. The existing POCs run on
+  0.8.10 while the current stable release is newer; existing checks must pass on
+  the selected version before the looper depends on newer FFI/process behavior.
+- Run the long-lived native Csound performance call on a dedicated Jolt OS
+  thread/future and mark it as blocking where the selected Jolt FFI requires it.
+- Do not drive `csoundPerformKsmps` from a Jolt allocation-heavy loop. Jolt must
+  remain outside the per-audio-block real-time path.
+- Exchange state through public Csound control/event APIs at a bounded polling
+  rate. Do not share unvalidated raw channel pointers across threads.
+- Give every engine-to-host note/status event a monotonically increasing
+  sequence number. A gap cancels the current command parser state rather than
+  guessing missing input.
+- Give every host-to-engine operation its own sequence number so a slow poll
+  cannot execute one operation twice or silently overwrite another.
+- Avoid C-to-Jolt callbacks in the first version. Add a minimal native shim only
+  if the API spike proves direct FFI plus polling insufficient.
+- Keep queues and event history bounded. Csound continues audio safely if the
+  dashboard or prompt coordinator is temporarily delayed.
+
+Carp remains a possible second host implementation after the semantics are
+stable. Its deterministic memory and direct C integration are valuable, but its
+no-GC advantage is not decisive while Csound—not the host language—owns the
+real-time audio path.
+
 ## Core model
 
 All musical layers are generic audio loop slots:
@@ -242,8 +300,7 @@ The detector produces explicit events:
  :degree      1
  :cents       7.2
  :hz          262.7
- :db          -23.4
- :confidence  0.97}
+ :db          -23.4}
 
 {:type       :note-off
  :id         123
@@ -259,7 +316,10 @@ Initial detector policy remains close to the proven POCs:
 
 - 55 ms stable-pitch confirmation.
 - Hysteretic RMS gate, initially -44/-50 dBFS.
-- Tartini confidence above 0.9 for the first JVM/SuperCollider implementation.
+- Csound `pitchamdf` over 70–1400 Hz at its native analysis rate, initially
+  without median filtering, downsampling, or an input prefilter.
+- Pitch validity comes from the RMS gate and frequency range; `pitchamdf` does
+  not provide Tartini-style confidence.
 - Approximately 120 ms release before clearing an active note.
 
 A repeated pitch may emit a second `note-on` only after a real `note-off`.
@@ -478,7 +538,7 @@ Confirmed exit:
 1. Fade the mixer over at least 30 ms.
 2. Stop/finalize or discard any active incomplete recording according to the
    explicit shutdown policy; never publish a partial clip as complete.
-3. Stop only the owned audio engine process.
+3. Stop and destroy only the embedded Csound instance owned by the host.
 4. Restore the terminal.
 5. Return an accurate process exit status.
 
@@ -568,7 +628,7 @@ LOOPERS
 6  STOPPED     length=8.000s
 
 PITCH DEBUG
-Gate: OPEN    Level: -23.4 dBFS    Confidence: 0.97
+Gate: OPEN    Level: -23.4 dBFS
 Current: C4   MIDI=60   degree=1   cents=+7.2   262.7 Hz
 Event: NOTE_ON C4
 History: C5 D5 C5 D5 C4
@@ -659,9 +719,15 @@ through side effects.
 
 - Do not start live audio during development unless the user explicitly requests
   playback/testing.
-- Keep the engine and host process in the foreground.
-- Preserve the independent 600-second wall-clock alarm and an engine-side
-  session limit.
+- Keep the Jolt host process in the foreground and keep the embedded Csound
+  instance owned by that process.
+- Run Csound performance outside Jolt's per-block allocation path; never call
+  terminal rendering or prompt logic from the real-time path.
+- Check the Jolt and Csound API versions before starting audio.
+- Treat engine/host event sequence gaps as command cancellation, never as a
+  partially recognized command.
+- Preserve the independent 600-second wall-clock alarm around the host process
+  and an engine-side session limit.
 - Ctrl+C must stop the owned engine and restore the terminal.
 - Never use `killall` or broad `pkill` cleanup.
 - Propagate nonzero engine failures.
@@ -692,6 +758,25 @@ Run without audio devices and verify:
 - Recording mode rejects commands for other slots.
 - Command suffixes cannot seed a new wake phrase.
 - Dashboard menu exactly matches policy output.
+
+### Embedded API checks
+
+Run without audio devices and verify:
+
+- Jolt can load the selected Csound 6 framework and read the expected API
+  version.
+- `csoundCreate`/compile/start/stop/cleanup/destroy succeeds through the isolated
+  FFI adapter.
+- A no-audio CSD can perform on the dedicated blocking worker while the Jolt
+  control/UI thread remains responsive.
+- Host-to-engine and engine-to-host sequence numbers are monotonic and duplicate
+  operations are rejected.
+- An injected event-sequence gap resets the command parser fail-closed.
+- Public control-channel access is safe under the selected Csound performance
+  model; otherwise the spike must stop and introduce a minimal native bridge
+  before application work continues.
+- Engine compile/start/runtime failures become structured host errors and leave
+  no live Csound instance.
 
 ### Audio checks without live input
 
@@ -730,9 +815,18 @@ Only when the user requests and is ready to play:
 - No destructive operation executes from a single unconfirmed token.
 - No recording is silently overwritten.
 - Menus, spoken prompts, and actual accepted commands remain consistent.
-- All owned audio processes stop on exit and no unrelated process is signaled.
+- The embedded Csound instance and any owned startup prompt-generation children
+  stop on exit; no unrelated process is signaled.
 
 ## Implementation sequence
+
+0. **Jolt/libcsound technical spike**
+   - Pin the Jolt version and Csound 6.18 API expectation.
+   - Load libcsound through `jolt.ffi` and validate its version.
+   - Create, compile, perform, stop, clean up, and destroy a no-audio instance.
+   - Prove the dedicated blocking performance worker does not block control/UI.
+   - Prove sequenced bidirectional control events and fail-closed gap handling.
+   - Record and replay a generated stereo signal offline before opening devices.
 
 1. **Pure domain model**
    - Scale/wake configuration.
@@ -776,12 +870,17 @@ Only when the user requests and is ready to play:
 
 ## Recommended first implementation target
 
-Use a new self-contained JVM Clojure/SuperCollider POC, derived from the pure
-control structure in `guitar_gesture_looper.clj` but recording engine PCM buffers
-instead of scheduling synthesized MIDI-note voices. Tartini remains a control
-input only.
+Create a new self-contained Jolt/Csound POC. Jolt owns startup configuration,
+the pure control reducer, command policy, voice coordination, dashboard, and
+error handling. Csound 6.18 is embedded through `jolt.ffi` and owns CoreAudio,
+`pitchamdf`, the sample clock, PCM buffers, playback, crossfades, prompt audio,
+and mixing.
 
-A separate source file is preferable while the existing note-based POCs remain
-useful as historical experiments. After behavior is stable, the same semantics
-may be ported to Jolt/Csound for comparison; the first implementation should not
-attempt simultaneous rewrites of all POCs.
+Borrow the host-owned pure-state architecture demonstrated by
+`guitar_gesture_looper.clj`, not its JVM, Overtone, SuperCollider, OSC, or
+Tartini dependencies. Do not copy the current Jolt scripts' blocking `sh`
+launcher or move the expanded command state machine into Csound orchestra code.
+
+Use a separate source file while the existing note-based POCs remain useful as
+historical experiments. Stabilize and verify one Jolt/libcsound implementation
+before considering a Carp host port; do not rewrite all POCs simultaneously.
