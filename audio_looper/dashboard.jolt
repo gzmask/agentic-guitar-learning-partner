@@ -1,0 +1,178 @@
+(ns audio-looper.dashboard
+  "Pure snapshot projection, bounded text rendering, and a 10fps redraw gate."
+  (:require
+    [audio-looper.control :as control]
+    [audio-looper.setup :as setup]
+    [clojure.string :as str]))
+
+
+(def pitch-classes ["C" "C#" "D" "D#" "E" "F" "F#" "G" "G#" "A" "A#" "B"])
+
+
+(defn safe-text
+  [value]
+  (apply str (map (fn [character]
+                    (let [code (int character)]
+                      (if (or (< code 32) (<= 127 code 159) (<= 8234 code 8238) (<= 8294 code 8297))
+                        \? character))) (str value))))
+
+
+(defn note-name
+  [midi]
+  (if (and (number? midi) (<= 0 midi 127))
+    (str (nth pitch-classes (mod (long midi) 12)) (dec (quot (long midi) 12))) "--"))
+
+
+(defn- seconds
+  [samples]
+  (format "%.3fs" (/ (double (or samples 0)) 44100.0)))
+
+
+(defn- slot-view
+  [state slot]
+  (let [record (:record-state slot)
+        play (:play-state slot)
+        label (cond (not= :idle record) record (not= :stopped play) play
+                    (= :ready (:clip-state slot)) :ready :else :empty)
+        duration (if (= :recording record) (max 0 (- (:sample state) (:start-sample slot)))
+                     (:length-samples slot))
+        cycle (if (and (= :playing play) (:play-start-sample slot) (pos? (:length-samples slot)))
+                (inc (quot (max 0 (- (:sample state) (:play-start-sample slot))) (:length-samples slot)))
+                (:cycle slot))
+        pending (:pending slot)]
+    {:id (:id slot) :state label :length (:length-samples slot) :duration duration :cycle cycle
+     :pending pending
+     :text (str (:id slot) "  " (str/upper-case (name label))
+                (when (pos? duration) (str "  " (seconds duration)))
+                (when (= :playing play) (str "  cycle=" cycle))
+                (when (:at-sample pending) (str "  queued@" (seconds (:at-sample pending)))))}))
+
+
+(defn- option-line
+  [{:keys [midi operation enabled? no-op? reason]}]
+  (str (note-name midi) "  " (str/replace (name operation) "-" " ")
+       "  [" (if enabled? (if no-op? "no-op" "enabled") "disabled")
+       (when reason (str ": " (str/replace (name reason) "-" " "))) "]"))
+
+
+(defn view
+  [state context]
+  (let [configuration (:profile state)
+        phase (get-in state [:parser :phase])
+        voice (:voice state)
+        estimate (:pitch context)
+        latest (:latest-note state)
+        midi (or (:midi estimate) (get-in state [:held :midi]))
+        deadline (get-in state [:parser :deadline])
+        degrees (str/join "  " (map-indexed #(str (inc %1) "=" (note-name %2)) (:selectors configuration)))
+        wake (str (str/join "-" (get-in configuration [:wake :degrees])) " ["
+                  (str/join " " (map note-name (get-in configuration [:wake :midi]))) "]")]
+    {:preview? (:preview? context) :debug? (:debug? context)
+     :columns (max 20 (min 200 (or (:columns context) 100)))
+     :rows (max 12 (min 80 (or (:rows context) 40)))
+     :input (str (:name (:input context)) " [" (:id (:input context)) "]")
+     :output (str (:name (:output context)) " [" (:id (:output context)) "]")
+     :phase (str/upper-case (name phase))
+     :voice (if voice (str (name (:state voice)) ": " (name (:prompt voice))) "idle")
+     :paused? (or voice (not (#{:dormant :wait-loop :wait-operation :confirm :confirm-held :wait-release} phase)))
+     :scale (or (:name configuration) "custom seven-degree scale") :degrees degrees :wake wake
+     :timeout (when deadline (format "%.1fs" (/ (double (max 0 (- deadline (:sample state)))) 44100.0)))
+     :slots (mapv #(slot-view state %) (:slots state))
+     :gate (if estimate (str (if (:gate? estimate) "OPEN" "CLOSED") "  level=" (:db estimate) " dBFS")
+               "unavailable; no detector connected")
+     :pitch (if midi (str (note-name midi) " MIDI=" midi
+                          (when estimate (format "  %+.1f cents  %.1f Hz" (double (or (:cents estimate) 0))
+                                                 (double (or (:hz estimate) 0))))) "--")
+     :event (if latest (str (name (:type latest)) " id=" (:id latest)) "none")
+     :history (str/join " " (map note-name (:note-history state)))
+     :parsed (str "wake-prefix=" (count (get-in state [:parser :tokens]))
+                  (when-let [id (get-in state [:parser :loop-id])] (str " -> LOOP " id))
+                  " -> " (name phase))
+     :options (control/navigation state)
+     :instruction (case phase :dormant (str "Wake by degree in any octave: " wake)
+                        :arm-release "Release the command note to begin recording."
+                        :wait-release "Release the first confirmation note."
+                        :confirm (str (note-name (get-in state [:parser :confirm-midi])) " hold >=800ms, then release.")
+                        :confirm-held "Hold >=800ms, then release into silence."
+                        :await-engine "Waiting for engine acknowledgement."
+                        "Listening paused during prompt/guard/transition.")
+     :configure? (setup/reconfigurable? state)
+     :events (mapv #(str (seconds (:sample %)) "  " (name (:type %))
+                         (when (:loop-id %) (str " loop=" (:loop-id %)))) (take-last 5 (:log state)))}))
+
+
+(defn- cell-width
+  [character]
+  (let [code (int character)]
+    (cond (or (<= 768 code 879) (<= 65024 code 65039) (= code 8205)) 0
+          (or (<= 4352 code 4607) (<= 11904 code 42191) (<= 44032 code 55203)
+              (<= 63744 code 64255) (<= 65281 code 65376) (<= 127744 code 129791)) 2
+          :else 1)))
+
+
+(defn- fit-line
+  [text columns]
+  (loop [characters (seq (safe-text text)) width 0 result []]
+    (if-let [character (first characters)]
+      (let [width (+ width (cell-width character))]
+        (if (< width columns) (recur (next characters) width (conj result character)) (apply str result)))
+      (apply str result))))
+
+
+(defn render
+  [snapshot]
+  (let [headers [(str "GUITAR AUDIO LOOPER" (when (:preview? snapshot) " - OFFLINE PREVIEW (NO AUDIO)"))
+                 (str "Input: " (:input snapshot)) (str "Output: " (:output snapshot))
+                 (str "Control: " (:phase snapshot) "  Voice: " (:voice snapshot)
+                      (when (:paused? snapshot) " [LISTENING PAUSED]"))]
+        scale (str "Scale: " (:scale snapshot))
+        wake (str "Wake (any octave): " (:wake snapshot))
+        timeout (str "Timeout: " (or (:timeout snapshot) "--"))
+        pitch-title (str "PITCH DEBUG [RAW " (if (:debug? snapshot) "ON" "OFF") "]")
+        options (if (seq (:options snapshot)) (map option-line (:options snapshot)) [(:instruction snapshot)])
+        keyboard (str "Keyboard: [d] debug  [c] configure" (when-not (:configure? snapshot) " (disabled)") "  [q] safe quit")
+        lines (if (< (:rows snapshot) 36)
+                (concat headers [(str scale " | " (:degrees snapshot)) (str wake " | " timeout) "LOOPERS"]
+                        (map #(str/join " | " (map :text %)) (partition-all 2 (:slots snapshot)))
+                        [(str pitch-title " " (:pitch snapshot) " | " (:gate snapshot))
+                         (str "Event: " (:event snapshot) " | History: " (:history snapshot))
+                         (str "Parsed: " (:parsed snapshot))
+                         "AVAILABLE GUITAR INPUT (reference octave; any octave accepted)"]
+                        options [keyboard (str "EVENTS " (last (:events snapshot)))])
+                (concat headers [scale (:degrees snapshot) wake timeout "LOOPERS"]
+                        (map :text (:slots snapshot))
+                        [pitch-title (str "Gate: " (:gate snapshot)) (str "Current: " (:pitch snapshot))
+                         (str "Event: " (:event snapshot)) (str "History: " (:history snapshot))
+                         (str "Parsed: " (:parsed snapshot))
+                         "AVAILABLE GUITAR INPUT (reference octave; any octave accepted)"]
+                        options [keyboard "EVENTS"] (:events snapshot)))]
+    (str (str/join "\n" (map #(fit-line % (:columns snapshot)) (take (dec (:rows snapshot)) lines))) "\n")))
+
+
+(defn renderer
+  [ansi?]
+  {:ansi? ansi? :last-time -100 :last-view nil :last-key nil})
+
+
+(defn- line-key
+  [snapshot]
+  (cond-> (select-keys snapshot [:input :output :phase :voice :scale :degrees :wake :options :debug?])
+    true (assoc :slots (mapv #(select-keys % [:id :state :length :pending]) (:slots snapshot)))
+    (:debug? snapshot) (assoc :pitch (:pitch snapshot) :gate (:gate snapshot)
+                              :event (:event snapshot) :events (:events snapshot))))
+
+
+(defn plan
+  "No printing here. One changed frame at most every 100ms; line mode omits raw
+  estimate and elapsed-time churn unless debug was explicitly requested."
+  [renderer snapshot now-ms]
+  (let [key (if (:ansi? renderer) snapshot (line-key snapshot))]
+    (if (or (= key (:last-key renderer)) (< (- now-ms (:last-time renderer)) 100))
+      [renderer nil]
+      [(assoc renderer :last-view snapshot :last-key key :last-time now-ms)
+       (cond
+         (:ansi? renderer) (str "\u001b[H\u001b[2J" (render snapshot))
+         (nil? (:last-view renderer)) (render snapshot)
+         :else (str "STATE control=" (safe-text (:phase snapshot)) " voice=" (safe-text (:voice snapshot))
+                    " loops=" (str/join "," (map #(str (:id %) ":" (name (:state %))) (:slots snapshot)))
+                    (when (:debug? snapshot) (str " PITCH " (safe-text (:pitch snapshot)))) "\n"))])))

@@ -1,0 +1,529 @@
+(ns audio-looper.dsp
+  "Csound owns PCM, analysis and sample clocks; no guitar-command grammar here."
+  (:require [clojure.string :as str]))
+
+
+(def ring-size 128)
+(def fields ["type" "sample" "id" "slot" "a" "b" "c" "d" "e"])
+(def operation-codes {:record-start 1 :record-finalize 2 :record-cancel 3
+                      :playback-start 4 :playback-stop 5 :buffer-erase 6
+                      :prompt 7 :prompt-cancel 8 :fade-mixer 9})
+(def event-types {1 :note-on 2 :note-off 3 :record-started 4 :record-finalized
+                  5 :record-cancelled 6 :playback-started 7 :playback-stopped
+                  8 :buffer-erased 9 :prompt-finished 10 :record-limit 11 :mixer-faded})
+
+
+(defn quote-path
+  [path]
+  (when (re-find #"[\"\n\r\\]" (str path))
+    (throw (ex-info "Unsupported character in Csound asset path." {:path path})))
+  (str "\"" path "\""))
+
+
+(def orchestra
+  "gkClock init 0
+gkOpSeq init 0
+gkSeq init 0
+gkFatal init 0
+gkQCount init 0
+gkQ[] init 288
+gkRecSlot init -1
+gkRec[] init 6
+gkStart[] init 6
+gkRecId[] init 6
+gkLength[] init 6
+gkOffset[] init 6
+gkPlay[] init 6
+gkPlayStart[] init 6
+gkPlayAt[] init 6
+gkPlayNext[] init 6
+gkPlayId[] init 6
+gkStopAt[] init 6
+gkPrompt init 0
+gkPromptId init 0
+gkPromptPos init 0
+gkPromptLength init 0
+gkPromptCancel init -1
+gkCueAt init -10000
+gkFadeAt init -1
+gkFadeEnd init 0
+gkFadeId init 0
+gkFadeDone init 0
+gkFailureAt init -1
+gkPeak init 0
+gaInL init 0
+gaInR init 0
+gaLoopL init 0
+gaLoopR init 0
+gaWeight init 0
+
+opcode Emit, 0, kkkkkkkkk
+  kt, ks, kid, kslot, ka, kb, kc, kd, ke xin
+  if gkQCount < 32 then
+    kp = gkQCount * 9
+    gkQ[kp] = kt
+    gkQ[kp+1] = ks
+    gkQ[kp+2] = kid
+    gkQ[kp+3] = kslot
+    gkQ[kp+4] = ka
+    gkQ[kp+5] = kb
+    gkQ[kp+6] = kc
+    gkQ[kp+7] = kd
+    gkQ[kp+8] = ke
+    gkQCount = gkQCount + 1
+  else
+    gkFatal = 6
+  endif
+endop
+
+instr 1
+  __SOURCE__
+  gaLoopL = 0
+  gaLoopR = 0
+  gaWeight = 0
+endin
+
+; One acknowledged host mailbox. Payload cannot be reused until h/ack.
+instr 2
+  kseq chnget \"h/seq\"
+  if kseq > gkOpSeq && gkFatal == 0 then
+    kop chnget \"h/op\"
+    kid chnget \"h/id\"
+    krawslot chnget \"h/slot\"
+    kat chnget \"h/at\"
+    klen chnget \"h/length\"
+    karg chnget \"h/arg\"
+    kslot = int(limit(krawslot, 0, 5))
+    if kseq != gkOpSeq + 1 then
+      gkFatal = 1
+    elseif kop != int(kop) || kop < 1 || kop > 9 || kid < 1 || kid != int(kid) || krawslot != kslot then
+      gkFatal = 2
+    elseif kop == 1 then
+      if gkRecSlot >= 0 || gkLength[kslot] > 0 || gkPlay[kslot] != 0 then
+        gkFatal = 3
+      elseif kat < gkClock || kat != int(kat) then
+        gkFatal = 4
+      else
+        gkRecSlot = kslot
+        gkRec[kslot] = 1
+        gkStart[kslot] = kat
+        gkRecId[kslot] = kid
+        gkOffset[kslot] = 0
+      endif
+    elseif kop == 2 then
+      if gkRecSlot != kslot || gkRec[kslot] < 2 || klen < 1 || klen > __CAP__ || klen != int(klen) || gkStart[kslot] + klen > gkClock then
+        gkFatal = 3
+      else
+        kactual = klen
+        koffset = 0
+        ; Auto-trim only when requested by the host (the first/master clip).
+        ; Per-10ms RMS blocks let this bounded scan ignore command audio that
+        ; arrived after the requested stop boundary.
+        if karg == 1 then
+          kblocks = ceil(klen / 441)
+          kfirst = -1
+          klast = -1
+          kscan = 0
+          while kscan < kblocks do
+            klevel tablekt kscan, 500+kslot
+            if klevel >= __TRIM_LEVEL__ then
+              if kfirst < 0 then
+                kfirst = kscan
+              endif
+              klast = kscan
+            endif
+            kscan = kscan + 1
+          od
+          if kfirst >= 0 then
+            koffset = max(0, (kfirst-2)*441)
+            kend = min(klen, (klast+6)*441)
+            if kend > koffset then
+              kactual = kend-koffset
+            endif
+          endif
+        endif
+        gkRec[kslot] = 0
+        gkRecSlot = -1
+        gkOffset[kslot] = koffset
+        gkLength[kslot] = kactual
+        Emit 4, gkClock, kid, kslot+1, kactual, koffset, 0, 0, 0
+      endif
+    elseif kop == 3 then
+      if gkRecSlot != kslot then
+        gkFatal = 3
+      else
+        gkRec[kslot] = 0
+        gkRecSlot = -1
+        gkLength[kslot] = 0
+        gkOffset[kslot] = 0
+        Emit 5, gkClock, kid, kslot+1, 0, 0, 0, 0, 0
+      endif
+    elseif kop == 4 || kop == 5 then
+      if gkLength[kslot] < 1 || gkRec[kslot] != 0 || gkPlayNext[kslot] != 0 then
+        gkFatal = 3
+      elseif kat < gkClock || kat != int(kat) then
+        gkFatal = 4
+      elseif (kop == 4 && gkPlay[kslot] != 0) || (kop == 5 && gkPlay[kslot] != 1) then
+        gkFatal = 3
+      else
+        gkPlayAt[kslot] = kat
+        gkPlayNext[kslot] = kop - 3
+        gkPlayId[kslot] = kid
+      endif
+    elseif kop == 6 then
+      if gkLength[kslot] < 1 || gkPlay[kslot] != 0 || gkPlayNext[kslot] != 0 || gkRec[kslot] != 0 then
+        gkFatal = 3
+      else
+        ; Invalidate the clip; keep fixed-capacity storage reserved for reuse.
+        gkLength[kslot] = 0
+        gkOffset[kslot] = 0
+        Emit 8, gkClock, kid, kslot+1, 0, 0, 0, 0, 0
+      endif
+    elseif kop == 7 then
+      if gkPrompt != 0 || karg < 1000 || karg >= 1000 + __PROMPT_COUNT__ || karg != int(karg) then
+        gkFatal = 7
+      else
+        gkPrompt = karg
+        gkPromptId = kid
+        gkPromptPos = 0
+        gkPromptLength = giPromptLengths[karg-1000]
+        gkPromptCancel = -1
+        gkCueAt = gkClock
+      endif
+    elseif kop == 8 then
+      if gkPromptId == karg && gkPrompt > 0 then
+        gkPromptCancel = gkClock
+      endif
+    elseif kop == 9 then
+      if gkFadeAt < 0 then
+        gkFadeAt = gkClock
+        gkFadeEnd = gkClock + max(1323, klen)
+        gkFadeId = kid
+      endif
+    endif
+    gkOpSeq = kseq
+    chnset kseq, \"h/ack\"
+  endif
+endin
+
+instr 10
+  if __DETECT__ == 1 then
+    ain = (gaInL + gaInR) * 0.5
+    khz, krms pitchamdf ain, 70, 1400, 0, 0, 1, 0, 0
+    kdb = 20 * log10(max(krms, 0.000000001))
+    kpitch = 69 + 12 * log(max(khz, 0.000000001) / 440) / log(2)
+    kmidi = round(kpitch)
+    kcents = (kpitch - kmidi) * 100
+    kgate init 0
+    kcandidate init -1
+    ksince init 0
+    kactive init -1
+    knoteid init 0
+    ksilence init -1
+    if kgate == 0 then
+      if kdb > __GATE__ then
+        kgate = 1
+      endif
+    elseif kdb <= __GATE__ - 6 then
+      kgate = 0
+    endif
+    if kgate == 1 && khz >= 70 && khz <= 1400 then
+      ksilence = -1
+      if kcandidate != kmidi then
+        kcandidate = kmidi
+        ksince = gkClock
+      elseif gkClock - ksince >= 2426 && kactive != kmidi then
+        if kactive >= 0 then
+          Emit 2, gkClock, knoteid, 0, ksince, 2, 0, 0, 0
+        endif
+        knoteid = knoteid + 1
+        kactive = kmidi
+        Emit 1, gkClock, knoteid, 0, kmidi, ksince, kcents, khz, kdb
+      endif
+    else
+      kcandidate = -1
+      if ksilence < 0 then
+        ksilence = gkClock
+      endif
+      if kactive >= 0 && gkClock - ksilence >= 5292 then
+        Emit 2, gkClock, knoteid, 0, ksilence, 1, 0, 0, 0
+        kactive = -1
+      endif
+    endif
+    chnset khz, \"pitch/hz\"
+    chnset kdb, \"pitch/db\"
+    chnset kmidi, \"pitch/midi\"
+    chnset kcents, \"pitch/cents\"
+    chnset kgate, \"pitch/gate\"
+    __TRACE__
+  endif
+endin
+
+opcode Slot, aaa, aai
+  setksmps 1
+  ainL, ainR, islot xin
+  itabL = 100 + islot*2
+  itabR = itabL+1
+  kpos init 0
+  kblock init -1
+  ksum init 0
+  kcount init 0
+  kinL downsamp ainL
+  kinR downsamp ainR
+  if gkFatal == 0 then
+    if gkRec[islot] == 1 && kpos == gkStart[islot] then
+      gkRec[islot] = 2
+      kblock = -1
+      ksum = 0
+      kcount = 0
+      gkCueAt = kpos
+      Emit 3, kpos, gkRecId[islot], islot+1, kpos, 0, 0, 0, 0
+    endif
+    if gkRec[islot] == 2 then
+      kindex = kpos - gkStart[islot]
+      if kindex >= 0 && kindex < __CAP__ then
+        tablew kinL, kindex, itabL
+        tablew kinR, kindex, itabR
+        knewblock = floor(kindex/441)
+        if knewblock != kblock then
+          kblock = knewblock
+          ksum = 0
+          kcount = 0
+        endif
+        ksum = ksum + (kinL*kinL + kinR*kinR)*0.5
+        kcount = kcount + 1
+        tablew sqrt(ksum/kcount), kblock, 500+islot
+      else
+        gkRec[islot] = 3
+        Emit 10, kpos, 0, islot+1, 0, 0, 0, 0, 0
+      endif
+    endif
+    if gkPlayNext[islot] > 0 && kpos == gkPlayAt[islot] then
+      if gkPlayNext[islot] == 1 then
+        gkPlay[islot] = 1
+        gkPlayStart[islot] = kpos
+        Emit 6, kpos, gkPlayId[islot], islot+1, kpos, 0, 0, 0, 0
+      else
+        gkPlay[islot] = 2
+        gkStopAt[islot] = kpos
+      endif
+      gkPlayNext[islot] = 0
+    endif
+  endif
+  kw = 0
+  koutL = 0
+  koutR = 0
+  if gkPlay[islot] > 0 && gkLength[islot] > 0 then
+    klen = gkLength[islot]
+    krelative = (kpos - gkPlayStart[islot]) % klen
+    kindex = gkOffset[islot] + krelative
+    kw = min(1, (kpos-gkPlayStart[islot])/441)
+    if gkPlay[islot] == 2 then
+      kw = min(kw, max(0, 1-(kpos-gkStopAt[islot])/441))
+      if kw <= 0 then
+        gkPlay[islot] = 0
+        Emit 7, kpos, gkPlayId[islot], islot+1, gkStopAt[islot], 0, 0, 0, 0
+      endif
+    endif
+    krawL table kindex, itabL
+    krawR table kindex, itabR
+    kmirror = gkOffset[islot] + klen - 1 - krelative
+    ktailL table kmirror, itabL
+    ktailR table kmirror, itabR
+    ; Symmetric 5ms head/tail crossfade: same value at both sides of the
+    ; seam, unchanged period and unchanged interior PCM. No resynthesis.
+    kfade = min(220, max(1, floor(klen/2)))
+    kblend = 0.5 * max(0, 1-min(krelative, klen-1-krelative)/kfade)
+    koutL = (krawL*(1-kblend) + ktailL*kblend) * kw
+    koutR = (krawR*(1-kblend) + ktailR*kblend) * kw
+  endif
+  aoutL = koutL
+  aoutR = koutR
+  aweight = kw
+  xout aoutL, aoutR, aweight
+  kpos = kpos + 1
+endop
+
+instr 20
+  aL, aR, aw Slot gaInL, gaInR, p4
+  gaLoopL = gaLoopL + aL
+  gaLoopR = gaLoopR + aR
+  gaWeight = gaWeight + aw
+endin
+
+opcode Output, aa, aaaaa
+  setksmps 1
+  ainL, ainR, aloopL, aloopR, aweight xin
+  kpos init 0
+  kinL downsamp ainL
+  kinR downsamp ainR
+  kloopL downsamp aloopL
+  kloopR downsamp aloopR
+  kw downsamp aweight
+  kvoice = 0
+  if gkPrompt > 0 then
+    kindex = gkPromptPos - 1544
+    if kindex >= 0 && kindex < gkPromptLength then
+      ktable = gkPrompt
+      kvoice tablekt kindex, ktable
+      kvoice = kvoice * min(1, kindex/441, (gkPromptLength-1-kindex)/441)
+    endif
+    if gkPromptCancel >= 0 then
+      kvoice = kvoice * max(0, 1-(kpos-gkPromptCancel)/441)
+    endif
+    if kindex >= gkPromptLength || (gkPromptCancel >= 0 && kpos >= gkPromptCancel + 441) then
+      Emit 9, kpos, gkPromptId, 0, 0, 0, 0, 0, 0
+      gkPrompt = 0
+    endif
+    gkPromptPos = gkPromptPos + 1
+  endif
+  kcue = 0
+  if kpos >= gkCueAt && kpos < gkCueAt+1544 then
+    knoise random -1, 1
+    kcue = 0.02*knoise*sin(3.14159265359*(kpos-gkCueAt)/1544)
+  endif
+  kgain = 1
+  if gkFadeAt >= 0 then
+    kgain = max(0, (gkFadeEnd-kpos)/(gkFadeEnd-gkFadeAt))
+    if kpos >= gkFadeEnd && gkFadeDone == 0 then
+      Emit 11, kpos, gkFadeId, 0, 0, 0, 0, 0, 0
+      gkFadeDone = 1
+    endif
+  endif
+  if gkFatal > 0 then
+    if gkFailureAt < 0 then
+      gkFailureAt = kpos
+    endif
+    kgain = min(kgain, max(0, 1-(kpos-gkFailureAt)/1323))
+  endif
+  kL = (__MONITOR__*0.3*kinL + 0.65*kloopL/max(1,kw) + 0.1*kvoice + kcue)*kgain
+  kR = (__MONITOR__*0.3*kinR + 0.65*kloopR/max(1,kw) + 0.1*kvoice + kcue)*kgain
+  gkPeak = max(gkPeak, abs(kL), abs(kR))
+  aL = limit(kL,-0.98,0.98)
+  aR = limit(kR,-0.98,0.98)
+  xout aL, aR
+  kpos = kpos + 1
+endop
+
+instr 30
+  aL, aR Output gaInL, gaInR, gaLoopL, gaLoopR, gaWeight
+  outs aL, aR
+endin
+
+instr 90
+  ; Events from local sample-rate UDOs are stably sorted within this block.
+  ; This keeps delivery timestamps monotonic even with six simultaneous slots.
+  kleft = gkQCount
+  kack chnget \"e/ack\"
+  while kleft > 0 do
+    kbest = -1
+    ktime = 1e20
+    ki = 0
+    while ki < gkQCount do
+      if gkQ[ki*9] > 0 && gkQ[ki*9+1] < ktime then
+        kbest = ki
+        ktime = gkQ[ki*9+1]
+      endif
+      ki = ki + 1
+    od
+    if kbest >= 0 then
+      if gkSeq-kack >= 128 then
+        gkFatal = 5
+      else
+        gkSeq = gkSeq + 1
+        kslot = gkSeq % 128
+        __PUBLISH__
+        Sseq sprintfk \"ev/%d/seq\", kslot
+        chnset gkSeq, Sseq
+        chnset gkSeq, \"e/write\"
+      endif
+      gkQ[kbest*9] = 0
+    endif
+    kleft = kleft - 1
+  od
+  gkQCount = 0
+  ; Publish clock LAST. Host reads clock BEFORE e/write, then drains all
+  ; included events before ticking its reducer. No torn clock/event snapshot.
+  gkClock = gkClock + ksmps
+  chnset gkClock, \"engine/clock\"
+  chnset gkFatal, \"engine/fatal\"
+  chnset gkPeak, \"engine/peak\"
+  ki = 0
+  while ki < 6 do
+    Slen sprintfk \"slot/%d/length\", ki
+    chnset gkLength[ki], Slen
+    ki = ki + 1
+  od
+endin
+
+; Offline checks can inject the SAME mailbox protocol before performance.
+; This instrument never exists as a guitar-command parser.
+instr 99
+  chnset p4, \"h/op\"
+  chnset p5, \"h/id\"
+  chnset p6, \"h/slot\"
+  chnset p7, \"h/at\"
+  chnset p8, \"h/length\"
+  chnset p9, \"h/arg\"
+  chnset p10, \"h/seq\"
+  turnoff
+endin")
+
+
+(defn document
+  [{:keys [input output input-device output-device input-channels capacity duration prompts operations
+           monitor? detect? gate trim-gate trace? live?]
+    :or {capacity 5292000 duration 600 input-channels 2 monitor? false detect? true
+         gate -44 trim-gate -50}}]
+  (when-not (and (integer? capacity) (<= 1 capacity 5292000) (<= 0.01 duration 600)
+                (<= -90 gate -6) (<= -90 trim-gate -6) (or input (and live? input-device output-device))
+                (or input (empty? operations)))
+    (throw (ex-info "Invalid DSP configuration or live fixture injection." {})))
+  (let [prompts (vec prompts)
+        source (if input (str "gaInL, gaInR diskin2 " (quote-path input) ", 1, 0, 0")
+                   (str "gaInL inch 1\n  " (if (= input-channels 1) "gaInR = gaInL" "gaInR inch 2")))
+        channels (concat (map #(str "chn_k \"h/" % "\", 1\n") ["seq" "op" "id" "slot" "at" "length" "arg"])
+                         ["chn_k \"e/ack\", 1\n"]
+                         (map #(str "chn_k \"" % "\", 2\n")
+                              ["h/ack" "e/write" "engine/clock" "engine/fatal" "engine/peak"
+                               "pitch/hz" "pitch/db" "pitch/midi" "pitch/cents" "pitch/gate"])
+                         (for [i (range 6)] (str "chn_k \"slot/" i "/length\", 2\n"))
+                         (for [i (range ring-size) field (conj fields "seq")]
+                           (str "chn_k \"ev/" i "/" field "\", 2\n")))
+        tables (concat
+                 (for [i (range 12)] (str "giB" i " ftgen " (+ 100 i) ", 0, -" capacity ", -2, 0\n"))
+                 (for [i (range 6)]
+                   (str "giActivity" i " ftgen " (+ 500 i) ", 0, -"
+                        (long (Math/ceil (/ capacity 441.0))) ", -2, 0\n"))
+                 (if (seq prompts)
+                   (map-indexed #(str "giP" %1 " ftgen " (+ 1000 %1) ", 0, -" (:frames %2) ", -2, 0\n") prompts)
+                   ["giSilence ftgen 1000, 0, -1, -2, 0\n"]))
+        trace (when trace? (str "tablew gkClock, (gkClock/ksmps)*3, 300\n"
+                               "tablew khz, (gkClock/ksmps)*3+1, 300\n"
+                               "tablew kdb, (gkClock/ksmps)*3+2, 300"))
+        publish (str/join "\n" (map-indexed
+                                 (fn [i field]
+                                   (str "S" i " sprintfk \"ev/%d/" field "\", kslot\n"
+                                        "chnset gkQ[kbest*9+" i "], S" i)) fields))
+        body (reduce-kv str/replace orchestra
+                        {"__CAP__" (str capacity) "__PROMPT_COUNT__" (str (count prompts))
+                         "__TRIM_LEVEL__" (str (Math/pow 10.0 (/ trim-gate 20.0)))
+                         "__SOURCE__" source "__DETECT__" (if detect? "1" "0") "__GATE__" (str gate)
+                         "__MONITOR__" (if monitor? "1" "0") "__TRACE__" (or trace "") "__PUBLISH__" publish})]
+    (str "<CsoundSynthesizer>\n<CsOptions>\n-d -m0 --sample-accurate "
+         (if input (if output (str "-W -f -o " (quote-path output)) "-n")
+             (str "-+rtaudio=coreaudio -i" input-device " -o" output-device))
+         "\n</CsOptions>\n<CsInstruments>\nsr=44100\nksmps=32\nnchnls=2\nnchnls_i=" input-channels "\n0dbfs=1\n"
+         (apply str channels) (apply str tables)
+         "giPromptLengths[] fillarray " (str/join "," (if (seq prompts) (map :frames prompts) [1])) "\n"
+         (when trace? (str "giTrace ftgen 300, 0, -" (* 3 (inc (long (Math/ceil (/ (* duration 44100) 32))))) ", -2, 0\n"))
+         body "\n</CsInstruments>\n<CsScore>\n"
+         (apply str (for [instrument [1 2 10 30 90]] (str "i " instrument " 0 " duration "\n")))
+         (apply str (for [i (range 6)] (str "i 20." (inc i) " 0 " duration " " i "\n")))
+         (apply str (map-indexed (fn [index op]
+                                  (str "i 99 " (/ (:sample op) 44100.0) " 0.001 "
+                                       (str/join " " [(get operation-codes (:type op)) (or (:id op) (inc index))
+                                                       (dec (or (:loop-id op) 1)) (or (:at-sample op) 0)
+                                                       (or (:length-samples op) 0) (or (:arg op) 0)
+                                                       (or (:seq op) (inc index))]) "\n")) operations))
+         "f 0 " duration "\ne\n</CsScore>\n</CsoundSynthesizer>\n")))

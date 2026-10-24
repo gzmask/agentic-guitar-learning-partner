@@ -1,0 +1,228 @@
+(ns audio-looper.engine-checks
+  "Finite offline checks of the actual production DSP, with generated PCM only."
+  (:require [audio-looper.csound :as native]
+            [audio-looper.engine :as engine]
+            [audio-looper.notes :as notes]
+            [audio-looper.voice :as voice]
+            [audio-looper.wav :as wav]
+            [clojure.java.io :as io]
+            [clojure.string :as str]))
+
+
+(defn- verify!
+  [label value]
+  (when-not value (throw (ex-info (str "DSP check failed: " label) {:check label}))))
+
+
+(defn- near?
+  [a b]
+  (< (Math/abs (- a b)) 0.000001))
+
+
+(defn- generate!
+  [owner name expression duration]
+  (let [file (.getPath (io/file (:directory @owner) name))]
+    (voice/run-child! owner 15000
+                      ["ffmpeg" "-v" "error" "-y" "-f" "lavfi" "-i"
+                       (str "aevalsrc=" (str/replace expression "," "\\,") ":s=44100:d=" duration)
+                       "-c:a" "pcm_f32le" file])
+    file))
+
+
+(defn- perform!
+  [configuration inspections]
+  (let [running (engine/open! configuration)]
+    (try
+      (native/await! (:instance running) 30000)
+      (let [snapshot (engine/poll! running)
+            data (mapv (fn [[table start count]] (native/table-range! (:instance running) table start count)) inspections)
+            lengths (mapv #(long (native/control (:instance running) (str "slot/" % "/length"))) (range 6))
+            peak (native/control (:instance running) "engine/peak")]
+        (engine/close! running)
+        {:events (:events snapshot) :tables data :lengths lengths :peak peak
+         :wave (when (:output configuration) (wav/read! (:output configuration)))})
+      (finally (engine/close! running)))))
+
+
+(defn- check-pcm!
+  [owner]
+  (let [input (generate! owner "stereo.wav" "0.25*sin(2*PI*220*t)|0.17*sin(2*PI*370*t)" 0.5)
+        original (wav/read! input)
+        output (.getPath (io/file (:directory @owner) "loop.wav"))
+        result (perform! {:input input :output output :duration 0.4 :capacity 4096 :detect? false
+                          :operations [{:type :record-start :sample 0 :at-sample 147}
+                                       {:type :record-finalize :sample 3500 :length-samples 3201}
+                                       {:type :playback-start :sample 3800 :at-sample 4507}
+                                       {:type :playback-stop :sample 12000 :at-sample 12503}
+                                       {:type :buffer-erase :sample 14000}]}
+                         [[100 0 3201] [101 0 3201]])
+        events (:events result) wave (:wave result)]
+    (doseq [channel (range 2) frame (range 3201)]
+      (verify! "every recorded stereo sample equals the original PCM"
+               (== (wav/sample original (+ 147 frame) channel) (get-in result [:tables channel frame]))))
+    (verify! "arbitrary sample start" (= 147 (:start-sample (first events))))
+    (verify! "play starts at exact unaligned target" (= 4507 (:sample (nth events 2))))
+    (verify! "stop acknowledges after the gain ramp"
+             (and (= 12503 (:at-sample (nth events 3))) (= 12944 (:sample (nth events 3)))))
+    (doseq [channel (range 2) frame (range 500 2800)]
+      (verify! "loop interior is original PCM, not a synth voice"
+               (near? (* 0.65 (wav/sample original (+ 147 frame) channel))
+                      (wav/sample wave (+ 4507 frame) channel))))
+    (verify! "boundary crossfade joins both sides without a jump"
+             (near? (wav/sample wave 7707 0) (wav/sample wave 7708 0)))
+    (verify! "erase invalidates only its clip" (= [0 0 0 0 0 0] (:lengths result)))
+    (verify! "no clipping" (< (:peak result) 0.98))
+    (println "PASS actual PCM: every stereo sample, unaligned boundaries, trim, seam/start/stop ramps, erase")))
+
+
+(defn- check-silence-trim!
+  [owner]
+  (let [input (generate! owner "trim.wav"
+                         "if(between(t,0.05,0.11),0.4*sin(2*PI*220*t),0)|if(between(t,0.05,0.11),0.25*sin(2*PI*330*t),0)"
+                         0.3)
+        result (perform! {:input input :output (.getPath (io/file (:directory @owner) "trimmed.wav"))
+                          :duration 0.3 :capacity 10000 :detect? false
+                          :operations [{:type :record-start :sample 0 :at-sample 147}
+                                       {:type :record-finalize :sample 8200 :length-samples 8000 :arg 1}
+                                       {:type :playback-start :sample 8400 :at-sample 9007}]} [])
+        finalized (first (filter #(= :record-finalized (:type %)) (:events result)))
+        offset (:offset-samples finalized)
+        length (:length-samples finalized)]
+    (verify! "leading silence is trimmed with bounded preroll" (<= 441 offset 1764))
+    (verify! "trailing silence is trimmed with bounded release tail" (< (+ offset length) 8000))
+    (verify! "trimmed native length becomes the playback period" (= length (first (:lengths result))))
+    (verify! "silence trim does not synthesize or clip playback" (< (:peak result) 0.5))
+    (println "PASS first/master clip outer-silence trim with preroll/tail and unchanged PCM")))
+
+
+(defn- check-six!
+  [owner]
+  (let [input (generate! owner "full-scale.wav" "0.99|-0.99" 0.4)
+        operations (vec (concat
+                          (mapcat (fn [i] [{:type :record-start :sample (* i 900) :loop-id (inc i)
+                                             :at-sample (+ (* i 900) 147)}
+                                            {:type :record-finalize :sample (+ (* i 900) 720)
+                                             :loop-id (inc i) :length-samples 512}]) (range 6))
+                          (for [i (range 6)] {:type :playback-start :sample (+ 6000 (* i 96))
+                                             :loop-id (inc i) :at-sample 8007})
+                          (for [i (range 6)] {:type :playback-stop :sample (+ 10000 (* i 96))
+                                             :loop-id (inc i) :at-sample 12019})
+                          [{:type :buffer-erase :sample 13050 :loop-id 3}]))
+        result (perform! {:input input :output (.getPath (io/file (:directory @owner) "six.wav"))
+                          :duration 0.35 :capacity 4096 :detect? false :monitor? true :operations operations} [])
+        starts (filter #(= :playback-started (:type %)) (:events result))
+        stops (filter #(= :playback-stopped (:type %)) (:events result))]
+    (verify! "six simultaneous native players" (= 6 (count starts)))
+    (verify! "all shared-boundary starts are exact" (every? #(= 8007 (:sample %)) starts))
+    (verify! "all shared-boundary stops are exact" (every? #(= 12019 (:at-sample %)) stops))
+    (verify! "event timestamps stay monotonic across six local sample clocks"
+             (apply <= (map :sample (:events result))))
+    (verify! "erasing slot three retains the other five" (= [512 512 0 512 512 512] (:lengths result)))
+    (verify! "coherent full-scale layers cannot clip" (< (:peak result) 0.96))
+    (verify! "stereo is not collapsed by mixing"
+             (and (near? (* 0.99 (+ 0.3 0.65)) (wav/sample (:wave result) 9000 0))
+                  (near? (* -0.99 (+ 0.3 0.65)) (wav/sample (:wave result) 9000 1))))
+    (println "PASS six native slots: exact common boundaries, stereo mix headroom, isolated erase")))
+
+
+(defn- check-capacity!
+  [owner]
+  (let [input (generate! owner "capacity.wav" "0.2*sin(2*PI*220*t)|0.1*sin(2*PI*330*t)" 0.25)
+        original (wav/read! input)
+        result (perform! {:input input :duration 0.2 :capacity 4096 :detect? false
+                          :operations [{:type :record-start :sample 0 :at-sample 147}
+                                       {:type :record-finalize :sample 5000 :length-samples 4096}]} [[100 4064 32]])
+        maximum (filter #(= :record-limit (:type %)) (:events result))]
+    (verify! "capacity freezes exactly once without writing one sample past" (= [4243] (mapv :sample maximum)))
+    (doseq [i (range 32)]
+      (verify! "last allocated samples remain intact" (== (wav/sample original (+ 147 4064 i) 0)
+                                                         (get-in result [:tables 0 i]))))
+    (verify! "maximum finalized clip has exact capacity" (= 4096 (first (:lengths result))))
+    (doseq [operations [[{:type :record-start :sample 0 :at-sample 147}
+                         {:type :record-finalize :sample 5000 :length-samples 0}]
+                        [{:type :record-start :sample 0 :at-sample 147 :seq 1}
+                         {:type :record-cancel :sample 2000 :seq 3}]]]
+      (verify! "invalid bounds/operation gap becomes a structured engine failure"
+               (try (perform! {:input input :duration 0.2 :capacity 4096 :detect? false :operations operations} [])
+                    false (catch Exception error (= :engine-error (:type (ex-data error)))))))
+    (let [duplicate (perform! {:input input :duration 0.2 :capacity 4096 :detect? false
+                              :operations [{:type :record-start :sample 0 :at-sample 147 :seq 1}
+                                           {:type :record-cancel :sample 2000 :id 99 :seq 1}
+                                           {:type :record-finalize :sample 3500 :length-samples 3201 :id 2 :seq 2}]} [])]
+      (verify! "duplicate native operation is not executed twice"
+               (= [:record-started :record-finalized] (mapv :type (:events duplicate)))))
+    (println "PASS native capacity/freeze, zero bounds, sequenced failures, duplicate rejection")))
+
+
+(defn- check-voice!
+  [owner]
+  (let [cache (voice/prepare! #{[:ready] [:loop-selected 1]} nil)]
+    (try
+      (let [entries (:entries @cache)
+            ready (first (filter #(= [:ready] (:key %)) entries))
+            selected (first (filter #(= [:loop-selected 1] (:key %)) entries))
+            result (perform! {:input (generate! owner "silence.wav" "0|0" 4.0)
+                              :output (.getPath (io/file (:directory @owner) "voice.wav"))
+                              :duration 4.0 :capacity 1 :detect? false :prompts entries
+                              :operations [{:type :prompt :sample 64 :id 50 :arg (:table ready)}
+                                           {:type :prompt-cancel :sample 20000 :id 51 :arg 50}
+                                           {:type :prompt :sample 40000 :id 52 :arg (:table selected)}]} [])
+            finished (filter #(= :prompt-finished (:type %)) (:events result))]
+        (verify! "cancelled prompt still returns its correlation id" (= 50 (:id (first finished))))
+        (verify! "next prompt starts only after bounded cancellation" (= 52 (:id (second finished))))
+        (verify! "prompt/cue playback remains below mix headroom" (< (:peak result) 0.2))
+        (verify! "generated speech is mixed into engine output, not say's device"
+                 (some #(> (Math/abs (wav/sample (:wave result) % 0)) 0.001)
+                       (range 0 (:frames (:wave result)) 100)))
+        (println "PASS finite TTS cache, engine-buffer prompt/cue, cancellation and completion IDs"))
+      (finally (voice/close! cache)))))
+
+
+(defn- check-detector!
+  [owner]
+  (let [tone "if(lt(t,0.4),sin(2*PI*261.625565*t),if(lt(t,0.6),0,if(lt(t,1),sin(2*PI*261.625565*t),if(lt(t,1.4),sin(2*PI*523.25113*t),0))))"
+        input (generate! owner "notes.wav" (str "0.3*" tone "|0.21*" tone) 1.7)
+        blocks (long (Math/ceil (/ (* 1.7 44100) 32)))
+        result (perform! {:input input :duration 1.7 :capacity 4096 :trace? true} [[300 0 (* 3 blocks)]])
+        estimates (map (fn [[sample hz db]] {:sample (long sample) :hz hz :db db}) (partition 3 (first (:tables result))))
+        [_ reference] (reduce (fn [[state history] estimate]
+                                (let [[state events] (notes/step state estimate)] [state (into history events)]))
+                              [(notes/initial-state) []] estimates)
+        actual (filter #(#{:note-on :note-off} (:type %)) (:events result))
+        signature #(select-keys % [:type :sample :id :midi :onset-sample :end-sample :reason])]
+    (verify! "native AMDF emits released repeats and direct octave change"
+             (= [60 60 72] (mapv :midi (filter #(= :note-on (:type %)) actual))))
+    (verify! "actual Csound lifecycle exactly matches pure reference on native estimates"
+             (= (mapv signature reference) (mapv signature actual)))
+    (println "PASS actual pitchamdf/gate/55ms/120ms lifecycle matches the pure reference")))
+
+
+(defn- check-assets!
+  []
+  (let [cache (voice/prepare! #{} nil)
+        directory (:directory @cache)]
+    (try
+      (verify! "owned child timeout is structured"
+               (try (voice/run-child! cache 20 ["/bin/sleep" "5"])
+                    false
+                    (catch Exception error (= :asset-error (:type (ex-data error))))))
+      (verify! "timed-out child is removed from ownership" (empty? (:children @cache)))
+      (spit (io/file directory "cleanup-marker") "owned")
+      (finally (voice/close! cache)))
+    (verify! "voice cache recursively removes its temporary assets"
+             (not (.exists (io/file directory))))
+    (voice/close! cache)))
+
+
+(defn check-engine!
+  []
+  (check-assets!)
+  (let [owner (voice/prepare! #{} nil)]
+    (try
+      (check-pcm! owner)
+      (check-silence-trim! owner)
+      (check-six! owner)
+      (check-capacity! owner)
+      (check-voice! owner)
+      (check-detector! owner)
+      (finally (voice/close! owner)))))

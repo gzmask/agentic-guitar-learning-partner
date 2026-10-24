@@ -1,0 +1,166 @@
+(ns audio-looper.runtime-checks
+  "Offline checks for the host reducer/effect adapter; no Csound instance or device."
+  (:require [audio-looper.control :as control]
+            [audio-looper.csound :as native]
+            [audio-looper.engine :as engine]
+            [audio-looper.runtime :as runtime]
+            [clojure.string :as str]))
+
+
+(defn- verify!
+  [label condition]
+  (when-not condition
+    (throw (ex-info (str "Runtime check failed: " label)
+                    {:type :check-failed :check label}))))
+
+
+(defn- fixture
+  []
+  {:running {:transport (atom {:event-seq 0})}
+   :cache (atom {:entries [{:key [:ready] :table 123}]})
+   :trace (atom [])})
+
+
+(defn- with-transport
+  [fixture f]
+  (with-redefs [engine/enqueue! (fn [_ operation]
+                                  (swap! (:trace fixture) conj [:enqueue operation]))
+                engine/discard-queued! (fn [_]
+                                         (swap! (:trace fixture) conj [:discard]))]
+    (f)))
+
+
+(defn- check-dispatch!
+  []
+  (let [{:keys [running cache trace] :as fixture} (fixture)
+        effects [{:type :prompt :id 1 :prompt :ready}
+                 {:type :play-queue :id 2 :operation :playback-start :loop-id 2 :at-sample 9000}
+                 {:type :prompt-cancel :id 3 :prompt-id 1}
+                 {:type :record-start :id 4 :loop-id 2 :at-sample 9100}
+                 {:type :record-finalize :id 5 :loop-id 2 :length-samples 44100}
+                 {:type :record-cancel :id 6 :loop-id 2}
+                 {:type :buffer-erase :id 7 :loop-id 2}
+                 {:type :fade-mixer :id 8 :duration-samples 1323}
+                 {:type :exit :id 9 :exit-code 4}]]
+    (with-transport fixture
+      #(verify! "exit status survives effect dispatch"
+                (= 4 (runtime/dispatch! running cache effects))))
+    (let [entries @trace
+          operations (mapv second (filter #(= :enqueue (first %)) entries))]
+      (verify! "prompt key maps to the preloaded native table"
+               (= {:type :prompt :id 1 :prompt :ready :arg 123} (first operations)))
+      (verify! "play queue becomes the requested native operation"
+               (= :playback-start (:type (second operations))))
+      (verify! "prompt cancellation carries its correlation id"
+               (= 1 (:arg (nth operations 2))))
+      (verify! "all confirming native operations are forwarded"
+               (= [:record-start :record-finalize :record-cancel :buffer-erase]
+                  (mapv :type (subvec operations 3 7))))
+      (verify! "queued operations are discarded before exit fade"
+               (= [[:discard] [:enqueue (last operations)]] (subvec @trace 7 9)))
+      (verify! "fade duration is translated for the native engine"
+               (= 1323 (:length-samples (last operations)))))))
+
+
+(defn- check-quit-round-trip!
+  []
+  (let [{:keys [running cache trace] :as fixture} (fixture)
+        state (runtime/initial-state control/default-profile)
+        [exiting exit] (with-transport fixture
+                         #(runtime/advance! running cache state
+                                            {:events [] :sample 100 :ended? false} true))]
+    (verify! "quit starts a correlated graceful fade"
+             (and (nil? exit) (= :exiting (:status exiting))
+                  (= 1 (get-in exiting [:shutdown :id]))
+                  (= [:discard] (first @trace))))
+    (reset! trace [])
+    (let [[stopped exit] (with-transport fixture
+                           #(runtime/advance! running cache exiting
+                                              {:events [{:type :mixer-faded :sample (+ 100 control/exit-ramp)
+                                                         :seq 1 :operation-id 1}]
+                                               :sample (+ 100 control/exit-ramp) :ended? false}
+                                              false))]
+      (verify! "matching native fade completion exits successfully"
+               (and (= :stopped (:status stopped)) (= 0 exit)))
+      (verify! "exit effect does not enqueue another native operation" (empty? @trace)))))
+
+
+(defn- check-terminal-engine-states!
+  []
+  (doseq [[label snapshot expected-status expected-exit]
+          [["normal engine end" {:events [] :sample 100 :ended? true} :stopped 0]
+           ["native engine error"
+            {:events [{:type :engine-error :sample 100 :seq 1}] :sample 100 :ended? false}
+            :failed 1]]]
+    (let [{:keys [running cache] :as fixture} (fixture)
+          [state exit] (with-transport fixture
+                         #(runtime/advance! running cache
+                                            (runtime/initial-state control/default-profile)
+                                            snapshot false))]
+      (verify! label (and (= expected-status (:status state)) (= expected-exit exit))))))
+
+
+(defn- check-quit-priority!
+  []
+  (let [{:keys [running cache] :as fixture} (fixture)
+        _ (reset! (:transport running) {:event-seq 7})
+        state (assoc (runtime/initial-state control/default-profile)
+                     :voice {:state :guard :id 40 :next :dormant :until 1})
+        [state exit] (with-transport fixture
+                       #(runtime/advance! running cache state
+                                          {:events [{:type :engine-error :sample 2 :seq 99}]
+                                           :sample 2 :ended? false}
+                                          true))]
+    (verify! "quit wins over expired timers and unread snapshot events"
+             (and (nil? exit) (= :exiting (:status state)) (= 7 (:event-seq state))))))
+
+
+(defn- check-engine-transport!
+  []
+  (let [channels (atom {"engine/clock" 100 "e/write" 1 "engine/fatal" 0
+                        "pitch/hz" 0 "pitch/db" -120 "pitch/midi" 0
+                        "pitch/cents" 0 "pitch/gate" 0 "h/ack" 0
+                        "ev/1/seq" 1 "ev/1/type" 6 "ev/1/sample" 100
+                        "ev/1/id" 9 "ev/1/slot" 2 "ev/1/a" 90
+                        "ev/1/b" 0 "ev/1/c" 0 "ev/1/d" 0 "ev/1/e" 0})
+        writes (atom [])
+        running {:instance :fake
+                 :transport (atom {:event-seq 0 :next-seq 1 :in-flight nil
+                                   :queue [] :held nil :last-note-id 0})}]
+    (with-redefs [native/check-health! (fn [_] nil)
+                  native/control (fn [_ channel] (get @channels channel 0))
+                  native/set-control! (fn [_ channel value]
+                                        (swap! writes conj [channel value])
+                                        (swap! channels assoc channel value))
+                  native/finished? (fn [_] false)]
+      (engine/enqueue! running {:type :playback-start :id 20 :loop-id 2 :at-sample 9000})
+      (let [snapshot (engine/poll! running)
+            host-writes (filterv #(str/starts-with? (first %) "h/") @writes)]
+        (verify! "committed native event is decoded before acknowledgement"
+                 (= [{:type :playback-started :sample 100 :seq 1 :loop-id 2
+                      :operation-id 9 :at-sample 90}]
+                    (:events snapshot)))
+        (verify! "native event ring acknowledgement is published" (= 1 (get @channels "e/ack")))
+        (verify! "host payload is published before its sequence"
+                 (and (= ["h/seq" 1] (last host-writes))
+                      (= 4 (get @channels "h/op")) (= 20 (get @channels "h/id"))
+                      (= 1 (get @channels "h/slot")) (= 9000 (get @channels "h/at")))))
+      (engine/enqueue! running {:type :playback-stop :id 21 :loop-id 2 :at-sample 12000})
+      (engine/poll! running)
+      (verify! "unacknowledged host operation applies backpressure"
+               (= 1 (get @channels "h/seq")))
+      (swap! channels assoc "h/ack" 1)
+      (engine/poll! running)
+      (verify! "matching acknowledgement releases exactly the next operation"
+               (and (= 2 (get @channels "h/seq")) (= 5 (get @channels "h/op"))
+                    (= 21 (get @channels "h/id")) (= 12000 (get @channels "h/at")))))))
+
+
+(defn check-runtime!
+  []
+  (check-dispatch!)
+  (check-quit-round-trip!)
+  (check-terminal-engine-states!)
+  (check-quit-priority!)
+  (check-engine-transport!)
+  (println "PASS runtime reducer/effect dispatch, correlation, quit priority and engine endings"))

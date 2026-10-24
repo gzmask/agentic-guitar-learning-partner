@@ -1,0 +1,52 @@
+(ns audio-looper.runtime
+  "Host-owned reducer/effect boundary, pumped at 100Hz outside native audio work."
+  (:require [audio-looper.control :as control]
+            [audio-looper.engine :as engine]
+            [audio-looper.voice :as voice]))
+
+
+(defn initial-state
+  [configuration]
+  (merge (control/initial-state configuration)
+         {:sample 0 :scheduling-lead 8192}))
+
+
+(defn dispatch!
+  [running cache effects]
+  (reduce (fn [exit-code effect]
+            (case (:type effect)
+              :exit (:exit-code effect)
+              :prompt (do (engine/enqueue! running (voice/operation cache effect)) exit-code)
+              :play-queue (do (engine/enqueue! running (assoc effect :type (:operation effect))) exit-code)
+              :prompt-cancel (do (engine/enqueue! running (assoc effect :arg (:prompt-id effect))) exit-code)
+              :fade-mixer (do (engine/discard-queued! running)
+                              (engine/enqueue! running (assoc effect :length-samples (:duration-samples effect))) exit-code)
+              (:record-start :record-finalize :record-cancel :buffer-erase)
+              (do (engine/enqueue! running effect) exit-code)
+              (throw (ex-info "Unhandled controller effect." {:effect effect}))))
+          nil effects))
+
+
+(defn apply-events!
+  [running cache state events]
+  (reduce (fn [[state exit-code] event]
+            (let [[state effects] (control/step state event)
+                  exit (dispatch! running cache effects)]
+              [state (if (some? exit) exit exit-code)]))
+          [state nil] events))
+
+
+(defn advance!
+  "Consume committed events before ticking the audio clock. q has priority over
+  expired prompt/arm timers, and clears operations not yet submitted to Csound."
+  [running cache state snapshot quit?]
+  (if (and quit? (= :running (:status state)))
+    (let [state (assoc state :event-seq (:event-seq @(:transport running)))
+          [state effects] (control/step state {:type :quit :sample (max (:sample state) (:sample snapshot))})]
+      [state (dispatch! running cache effects)])
+    (let [[state exit] (apply-events! running cache state (:events snapshot))]
+      (if (some? exit)
+        [state exit]
+        (let [[state effects] (control/step state {:type (if (:ended? snapshot) :engine-ended :tick)
+                                                  :sample (max (:sample state) (:sample snapshot))})]
+          [state (dispatch! running cache effects)])))))

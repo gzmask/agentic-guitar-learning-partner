@@ -2,16 +2,162 @@
 
 ## Status
 
-This document is the agreed design for the next looper POC. It is a plan, not
-an implementation.
+This document is the design and verification record for the looper POC.
+Implementation covers **stages 0–6** and passes the complete offline suite. The
+explicit live path is connected and completed an initial real FX100/guitar pass.
+That pass exposed octave ergonomics and outer-silence issues; the resulting
+pitch-class and master-trim changes pass offline gates and now need a short
+follow-up hardware validation. Entrypoints:
+
+```bash
+jolt guitar-audio-looper.jolt                 # OFFLINE UI preview; no audio stream
+jolt guitar-audio-looper.jolt --no-tui        # plain preview; redirected output exits after one snapshot
+jolt guitar-audio-looper.jolt --devices       # current CoreAudio metadata only
+jolt guitar-audio-looper.jolt --check-control # pure control checks
+jolt guitar-audio-looper.jolt --check-ui      # pure setup/renderer checks
+jolt guitar-audio-looper.jolt --check-runtime # reducer/effect adapter checks
+jolt guitar-audio-looper.jolt --check-engine  # production DSP/PCM/TTS checks
+jolt guitar-audio-looper.jolt --check         # complete offline suite
+jolt guitar-audio-looper.jolt --live          # live mode; input selection starts audio
+```
+
+Sources: `audio_looper/csound.jolt` and `audio_looper/diagnostics.c` own native
+integration; `control.jolt` and `notes.jolt` own pure policy/reference behavior;
+`dsp.jolt` and `engine.jolt` own the production Csound document and bounded
+transport; `runtime.jolt` owns reducer/effect dispatch; `voice.jolt` owns finite
+temporary prompt assets; `setup.jolt`, `dashboard.jolt`, and `terminal.jolt`
+separate setup, immutable rendering, and foreground I/O. The `*_checks.jolt`
+files provide deterministic offline gates. No dependency manifest, service, or
+background controller was added. Existing song/detector/note-looper files remain
+untouched.
+
+Stage 0 verifies version gates, native lifecycle, a dedicated blocking worker,
+public scalar channels, acknowledged mailboxes, generated stereo PCM replay,
+injected failures, signal cleanup, and the independent OS alarm. The production
+gates additionally verify arbitrary sample boundaries and trimming, ramps and
+seams, six native slots, shared boundaries, capacity freezing, bounded committed
+events, prompt playback/cancellation, and the actual `pitchamdf` lifecycle against
+the pure reference. Every recorded stereo sample is compared with its source.
+
+Only `--live` can open devices. It requires a foreground TTY and fresh UID-based
+device resolution. Input selection is the sole mandatory keyboard setup and uses
+the default C-major profile immediately. A warning is printed, but the explicit
+`--live` invocation replaces the former redundant typed `LIVE` confirmation.
+
+### Stage 1: pure control model
+
+- `(step state event) => [state effects]` performs no I/O. Engine buffers remain
+  opaque handles; a pending operation does not publish a clip until its matching
+  engine acknowledgement is validated. Engine errors return a failing exit effect.
+- Eight ascending scale pitches validate the seven-degree mapping and octave.
+  Wake vectors retain captured MIDI pitches for display and degrees for parsing.
+  Wake, selector, action, and confirmation matching is octave-independent within
+  the detector range; parser phase disambiguates selection from action.
+- The note reference distinguishes estimated onset from confirmation and silence
+  onset from release confirmation. Held notes, brief gate dips and direct octave
+  changes have explicit lifecycle checks. The production native detector is
+  checked against this reference on captured engine estimates; it is not a
+  host-driven real-time DSP path.
+- Wake suffix recovery, four-second phrase/command windows, ±35-cent matching,
+  consumed commands, prompt-completion IDs, 125 ms guards and 250 ms cooldowns
+  are covered. Tokens during speech/guards are consumed, never deferred.
+- Every policy row generates the same menu data used by command validation.
+  The global restriction while a recorder is active (including armed/finalizing)
+  takes precedence over local no-op entries: only its record-stop and the exit
+  path remain available. There is no overwrite, overdub, or second recorder.
+- Record start waits for both prompt/guard completion **and confirmed command
+  silence**. Otherwise a held final control note would leak into PCM. An
+  unscheduled arm times out after four seconds waiting for release. A delayed
+  poll plans a start from the current sample clock, never in the past.
+- Record stop uses the first wake note's onset, and later takes/playback use the
+  shared master boundaries. First finalization establishes the period; erasing
+  its original slot retains it until all clips are empty. The native engine
+  freezes writing exactly at capacity before notifying the host.
+- Erase is a direct phase-disambiguated action like record/play operations and
+  still waits for its matching native acknowledgement before publishing empty.
+  Exit alone requires release, a fresh note held for at least 800 ms, and confirmed
+  silence before the mixer fade.
+- One global engine event sequence rejects duplicates and cancels parsing on a
+  gap. If an audio operation is in flight, a gap fails closed with shutdown rather
+  than guessing whether it ran. Effect IDs are separately monotonic correlation
+  IDs; the transport separately sequences every actual native operation.
+- Semantic input history is capped at 32 entries, note history at 12, notification
+  intents at 8; notification overflow fails closed. Actual prompt generation,
+  engine execution, ANSI rendering, interactive scale/wake capture, and live
+  validation are not part of stage 1.
+
+### Stage 2: keyboard setup and dashboard
+
+- Default/`--preview` is an explicitly labeled **offline UI**, never a silent
+  launch of live audio. It shows actual selected devices and six empty slots;
+  it does not fabricate notes, clips, playback or engine acknowledgements.
+- The keyboard selects from current CoreAudio input metadata. The configured
+  default output is shown. Selection retains stable UIDs; fresh resolution
+  rejects unplugged/ambiguous devices rather than following a stale adcN/dacN.
+- Metadata uses bounded, size-checked CoreAudio property reads through the same
+  FFI adapter, with no input/output stream. Device ordering matches the pinned
+  Csound 6.18 rtauhal module's separate input/output numbering. Every UTF-8/array
+  access is checked against the returned property size; CF strings are released.
+- Selecting the input completes startup with the default C-major profile; no
+  keyboard profile question or typed live confirmation remains. Other/unknown
+  inputs still require explicit headphone confirmation and default monitoring off.
+- The pure setup model retains custom-scale capture logic for offline validation,
+  but startup intentionally does not expose it: octave-independent degree matching
+  makes the default C-major profile usable across the guitar range.
+- Immutable snapshots contain slot states/durations/queues/cycles, profile and
+  wake registers, pitch/event history, parser/voice/timeout state and the policy's
+  own navigation menu. A compact layout retains the menu/footer on 24-row
+  terminals; longer output is clipped without wrapping past the viewport.
+- Redraw is change-driven and capped at 10 FPS. Plain output excludes raw
+  analyzer/elapsed-time churn unless debug was opted into. Device/event text is
+  sanitized against terminal escape/control injection. No rendering is called
+  from an audio callback.
+- `d/c/q`, Ctrl+D and input EOF are handled; reconfiguration is allowed only
+  for an empty, idle session. Redirected preview prints one ANSI-free snapshot
+  and exits. `--no-tui` is ANSI-free even on a terminal.
+- Owned terminal state is captured before cbreak/no-echo mode. ISIG stays enabled
+  so Ctrl+C remains a safety signal. Normal quit, Ctrl+D, SIGINT, SIGTERM and
+  injected renderer failures have been exercised in real pseudo-terminals:
+  terminal configuration, cursor and alternate screen restore correctly; exits
+  are respectively 0/0/130/143/1. The PTY comparison ignores only BSD's transient
+  PENDIN kernel status bit, not any configuration flag. Startup stty children
+  are bounded and owned; stdin polling is a blocking-marked native call.
+- The independent 600-second OS alarm remains, with a 599-second graceful UI
+  deadline. Cancelling at input selection exits before prompt or engine startup;
+  production DSP/effect dispatch and spoken prompts pass offline checks.
+
+### Decisions established by the spike
+
+- Pin **Jolt v0.8.10**: its `:blocking` FFI and dedicated `Thread` support suffice.
+  Existing Jolt lint/format/syntax checks pass; no runtime upgrade is required.
+- Require **Csound 6.18**, API **400**, and **8-byte MYFLT**; reject incompatible
+  versions before creating an engine or binding MYFLT-dependent functions.
+- Use public thread-safe `csoundGetControlChannel`/`csoundSetControlChannel`, not
+  shared raw channel pointers. Publish payload before sequence, and do not reuse
+  a mailbox until acknowledged. The production transport adds a bounded committed
+  event ring and correlates every operation with reducer effect IDs.
+- `csoundPerform` may return the same positive end-of-score code after an
+  instrument initialization error as on success. The public message-buffer API
+  is unbounded. A minimal C bridge therefore uses the public message-string
+  callback to set one lock-free atomic error flag, with no C-to-Jolt callback,
+  printing, allocation, or text queue. Csound also marks some startup banners as
+  errors: compile/start return codes validate startup, then the latch is reset
+  before performance. Host polling and completion both inspect it.
+- The bridge is compiled with `/usr/bin/cc` into a temporary dylib and linked to
+  the same shared Csound framework and libsndfile. Besides latching errors, it
+  bulk-copies validated mono prompt WAVs into preallocated Csound tables.
+  Compilation is bounded and its owned child is cleaned up. This adds Apple
+  command-line-tools and libsndfile requirements to the new POC only.
+- Correct the original buffer assumption/budget below: the installed engine
+  stores tables as float64. Float32 remains the offline WAV format, not the
+  engine's internal sample representation.
 
 The new looper records and replays the guitar's **stereo PCM waveform**. Pitch
 tracking is used only for control commands. It must never convert the recorded
 performance into MIDI notes or resynthesize the guitar tone.
 
-The existing song comparison and detector/looper experiments remain unchanged
-until this plan is implemented and verified. In particular, `song.carp` and
-`song.jolt` are out of scope.
+The existing song comparison and detector/looper experiments remain unchanged.
+In particular, `song.carp` and `song.jolt` are out of scope.
 
 ## Goals
 
@@ -150,6 +296,9 @@ Important boundaries:
 - With a physical microphone, speakers can still leak into the microphone.
   Microphone mode therefore requires headphones and disables raw software
   monitoring by default.
+- FX100 software monitoring uses 0.30 gain. The normalized loop bus uses 0.65,
+  making recorded playback dominant over the software live path while keeping a
+  coherent full-scale monitor-plus-loop mix below the final ±0.98 limiter.
 
 ### Audio format and capacity
 
@@ -157,12 +306,15 @@ Initial defaults:
 
 - 44.1 kHz.
 - Stereo.
-- Float32 engine buffers.
+- Float64 engine buffers for the selected double-MYFLT Csound build.
+- Float32 offline WAV output in the stage-0 verification fixture.
 - Maximum 120 seconds per slot.
 - At most one slot recording at a time.
 - Up to six slots playing at once.
-- Approximately 42.3 MiB maximum PCM data per 120-second stereo slot and about
-  254 MiB if all six slots reach the maximum.
+- 84,672,000 bytes (about 80.75 MiB) maximum PCM data per 120-second stereo
+  slot, about 484.5 MiB for all six, excluding engine/table overhead. A future
+  explicitly packed float32 implementation could halve this, but ordinary
+  tables in the selected double-MYFLT engine do not.
 
 A real-time loop lives in an engine buffer. Writing a `.wav` file is an optional
 future export operation, not part of the playback path.
@@ -177,14 +329,14 @@ and application exit use a short gain ramp rather than an instantaneous cut.
 
 ## Startup flow
 
-Input selection must happen before guitar-driven setup because the program
-cannot detect guitar notes before opening an input device.
+Only input selection requires a keyboard. Octave-independent degree matching
+makes one default C-major profile usable across the supported guitar range.
 
 ```text
 1. Select input device using the keyboard.
-2. Select default or custom control configuration.
-3. Open and validate the audio engine.
-4. Preload voice prompts.
+2. Attach the default C-major control profile.
+3. Generate and validate the finite prompt cache (audio is still closed).
+4. Re-resolve the selected device UID and open the audio engine.
 5. Show the dashboard and wait for the wake phrase.
 ```
 
@@ -196,13 +348,10 @@ Input device:
 2. Mac microphone
 > 1
 
-Control setup:
-1. Default: C major, wake = C D C D
-2. Customize scale and wake phrase
-> [Enter]
+Default control: C major; wake degrees = 1 2 1 2
 ```
 
-Pressing Enter selects the default configuration. Input device names must be
+Selecting the input completes configuration. Input device names must be
 resolved from the currently available CoreAudio devices; volatile `adcN` numbers
 must not be treated as permanent identities.
 
@@ -221,7 +370,7 @@ Degree:  1   2   3   4   5   6   7
 Note:    C   D   E   F   G   A   B
 ```
 
-Default registers:
+Default display/reference registers:
 
 ```text
 Wake:       C5 D5 C5 D5
@@ -229,32 +378,36 @@ Selectors:  C4 D4 E4 F4 G4 A4 B4
 Operations: C5 D5 E5 F5 G5
 ```
 
-Using a lower selector register and a higher operation register prevents a
-command such as "Loop 1, record start" from becoming two indistinguishable C
-notes. It is physically `C4 -> C5`, while remaining logically `degree 1 ->
-degree 1`.
+The displayed lower selector and higher operation registers are ergonomic
+references, not matching constraints. Prompt/guard phases separate loop selection
+from action selection, so both are matched by scale-degree pitch class in any
+supported octave. `C3 -> C3`, `C4 -> C5`, and mixed-octave wake phrases are
+therefore unambiguous in their respective parser phases.
 
-### Customization
+### Retained customization model
 
-Custom setup asks the player to play an ascending seven-note scale plus the
-upper tonic:
+The current startup intentionally skips this model and selects C major after the
+input. The pure setup reducer still validates an ascending seven-note scale plus
+the upper tonic for possible future exposure:
 
 ```text
 1 2 3 4 5 6 7 1'
 ```
 
 The first note is explicitly the tonic. The eighth note validates the octave and
-completeness of the scale. The first seven played MIDI pitches become the lower
-selector register; operation pitches are derived one octave above where they
-remain in the supported detector and guitar range.
+completeness of the scale. The first seven captured pitches and, when they remain
+inside 70–1400 Hz, pitches one octave above are retained as display/playability
+references. High profiles fall back to their captured octave. Command execution
+matches their seven unique pitch classes, so the player may move any token to a
+more comfortable supported octave.
 
 The first version supports seven-degree scales only. It stores the degree-to-
 pitch mapping; identifying a familiar display name such as "C major" is useful
 but is not required for command execution.
 
-Pitch classes alone are not enough for command parsing. Wake, selector, and
-operation tokens also retain their configured register to reduce collisions
-with ordinary playing.
+Pitch classes are sufficient because parser phase, spoken feedback, and guards
+separate wake, loop selection, operation selection, and confirmation. Captured
+registers remain useful display hints but are not command constraints.
 
 ## Wake phrase
 
@@ -264,22 +417,21 @@ The default wake phrase is:
 C5 D5 C5 D5
 ```
 
-Internally it is represented both as exact configured pitches and as scale
-degrees:
+Internally it retains captured pitches for display and scale degrees for
+register-independent matching:
 
 ```clojure
 {:midi    [72 74 72 74]
  :degrees [1 2 1 2]}
 ```
 
-Custom setup asks the player to perform a 3–6 note wake phrase and then remain
-silent for one second. The screen displays the captured notes and degrees before
-accepting it.
+The retained capture model accepts a 3–6 note wake phrase followed by one second
+of silence. It is covered offline but is not a startup question.
 
 Wake matching requirements:
 
 - Stable pitch confirmation before emitting a note event.
-- Configured-register matching, not only pitch-class matching.
+- Scale-degree pitch-class matching in any supported octave.
 - Maximum cents deviation from the target, initially ±35 cents.
 - Explicit note events rather than raw analyzer samples.
 - A bounded phrase-completion window.
@@ -429,7 +581,7 @@ Operations are explicit and idempotent; they are not toggles.
 | Empty | Enabled | Disabled | Disabled | No-op | Disabled |
 | Armed/recording | No-op | Enabled for active slot | Disabled | Disabled | Disabled |
 | Finalizing | Disabled | No-op | Disabled | Disabled | Disabled |
-| Ready/stopped | Disabled | Disabled | Enabled | No-op | Enabled with confirmation |
+| Ready/stopped | Disabled | Disabled | Enabled | No-op | Enabled immediately |
 | Playing | Disabled | Disabled | No-op | Enabled | Disabled |
 | Queued transition | Disabled | Disabled | State-dependent no-op | State-dependent no-op | Disabled |
 
@@ -451,8 +603,11 @@ for one slot from being recorded into another slot's PCM waveform.
 
 1. Recognize and validate the complete command.
 2. Announce that recording is armed.
-3. Wait for the voice prompt and guard interval to finish.
-4. Start at the selected synchronization boundary.
+3. Wait for the voice prompt and guard interval to finish, and require confirmed
+   silence after the command. A held final command note cannot start the recorder;
+   cancel an unscheduled arm after four seconds waiting for release.
+4. Start at the selected synchronization boundary, planned from the current
+   audio clock (not a past prompt/guard timestamp after a delayed poll).
 5. Emit a short non-pitched cue and announce/display `RECORDING`.
 
 No startup command or voice prompt may enter the recorded buffer.
@@ -467,8 +622,13 @@ wake phrase and command notes would already have been recorded.
 3. After a valid `record stop`, choose the final audio boundary at or before that
    onset according to the synchronization policy.
 4. Discard all PCM samples after that boundary.
-5. Apply the boundary crossfade.
-6. Mark the clip ready and announce completion.
+5. For the first/master clip, scan bounded 10 ms stereo-RMS summaries and remove
+   outer silence below -50 dBFS, retaining 20 ms preroll and 50 ms release tail.
+   This adjusts the master origin and period without changing any retained PCM.
+   Later synchronized clips retain complete master cycles; removing partial-cycle
+   silence would destroy their phase alignment.
+6. Apply the boundary crossfade.
+7. Mark the clip ready and announce completion.
 
 An invalid or timed-out command does not stop recording. Because commands other
 than record stop are rejected during recording, the first implementation does
@@ -497,7 +657,8 @@ initial behavior.
 
 ## Erase operation
 
-Erase is destructive and requires explicit confirmation.
+Erase is destructive but follows the same one-action-note flow as record and
+playback:
 
 ```text
 WAKE -> LOOP_SELECTOR -> degree 5
@@ -509,18 +670,10 @@ Example:
 C5 D5 C5 D5 -> C4 -> G5
 ```
 
-Flow:
-
-1. Receive the first G5 and wait for its `note-off`.
-2. Say: `Erase looper one? Play G again to confirm.`
-3. Wait for the prompt and guard interval.
-4. Require a fresh G5 note, held for at least 800 ms and then released.
-5. On success, fade/release the clip buffer and set the slot to empty.
-6. Any other note or timeout cancels without changing the clip.
-
-Erase is enabled only for a ready, stopped clip. A playing loop must first receive
-an explicit playback-stop command. Erase never implicitly stops and deletes a
-playing clip.
+The reducer immediately issues one correlated native `buffer-erase` effect and
+publishes the slot as empty only after the matching engine acknowledgement.
+There is no second note, hold, or release confirmation. Erase remains enabled
+only for a ready, stopped clip; it never implicitly stops a playing clip.
 
 ## Exit operation
 
@@ -570,7 +723,7 @@ Minimum prompts:
 - Select action.
 - Recording armed / recording / recorded.
 - Playback queued / playing / stopped.
-- Erase confirmation / erased.
+- Erased.
 - Invalid command and state-specific rejection.
 - Command cancelled.
 - Exit confirmation / exiting.
@@ -639,7 +792,7 @@ C5  Record start       [disabled: clip already exists]
 D5  Record stop        [disabled: not recording]
 E5  Playback start     [enabled]
 F5  Playback stop      [disabled: not playing]
-G5  Erase recorded     [enabled: confirmation required]
+G5  Erase recorded     [enabled]
 
 Keyboard: [d] raw pitch debug  [c] configure  [q] safe quit
 --------------------------------------------------------------------
@@ -688,7 +841,8 @@ them.
 - Redraw only when relevant state changes.
 - Hide and restore the cursor correctly.
 - Restore terminal state on normal exit, Ctrl+C, and handled failures.
-- Provide `--no-tui` line-oriented output for checks and redirected logs.
+- Provide `--no-tui` line-oriented output for checks and redirected logs. It
+  intentionally does not render the fixed dashboard mockup; omit the flag for TUI.
 - Raw analyzer output is opt-in and rate-limited; it is never printed at the
   analyzer's full rate.
 
@@ -746,15 +900,16 @@ Run without audio devices and verify:
 
 - Default and custom scale mapping.
 - Wake prefix matching, timeout, recovery, and consumption.
-- Register-aware selector/action parsing.
+- Pitch-class-aware selector/action parsing across supported octaves.
 - Held note produces one token.
 - Released/rearticulated same pitch produces two tokens.
 - `C4 -> C5` produces selector degree 1 then operation degree 1.
 - All state/operation policy combinations.
 - Duplicate commands are idempotent.
 - Prompt and guard states reject premature tokens.
-- Erase and exit require release plus fresh held confirmation.
-- Invalid/timeout destructive commands preserve buffers.
+- Direct erase waits for a matching native acknowledgement; exit retains its
+  fresh held confirmation.
+- Invalid/timeout exit confirmation preserves buffers.
 - Recording mode rejects commands for other slots.
 - Command suffixes cannot seed a new wake phrase.
 - Dashboard menu exactly matches policy output.
@@ -785,6 +940,8 @@ Using generated temporary audio buffers:
 - Stereo input remains stereo and is not resynthesized.
 - Record-start boundary excludes prompts and command audio.
 - Record-stop trimming uses wake onset/sample time, not confirmation time.
+- First/master recording outer silence is trimmed from bounded RMS summaries,
+  with documented preroll/tail; synchronized later clips preserve cycle phase.
 - Buffer bounds hold at zero, normal, and maximum durations.
 - Boundary crossfades avoid discontinuities.
 - Six concurrent players mix without clipping under the defined gain policy.
@@ -797,7 +954,7 @@ Using generated temporary audio buffers:
 Only when the user requests and is ready to play:
 
 - FX100 and microphone selection.
-- Default C-major setup and custom setup.
+- Default C-major setup begins immediately after input selection.
 - Wake recognition under clean and effected guitar tones.
 - Same-note staccato behavior.
 - Voice prompt timing and command guards.
@@ -812,7 +969,8 @@ Only when the user requests and is ready to play:
   approximation.
 - A held pitch never becomes two command tokens.
 - Intentional repeated notes are reliably separable with documented articulation.
-- No destructive operation executes from a single unconfirmed token.
+- Exit cannot execute from a single unconfirmed token; erase is intentionally a
+  direct action and still requires a selected stopped slot plus native acknowledgement.
 - No recording is silently overwritten.
 - Menus, spoken prompts, and actual accepted commands remain consistent.
 - The embedded Csound instance and any owned startup prompt-generation children
@@ -820,7 +978,7 @@ Only when the user requests and is ready to play:
 
 ## Implementation sequence
 
-0. **Jolt/libcsound technical spike**
+0. **Jolt/libcsound technical spike — complete**
    - Pin the Jolt version and Csound 6.18 API expectation.
    - Load libcsound through `jolt.ffi` and validate its version.
    - Create, compile, perform, stop, clean up, and destroy a no-audio instance.
@@ -828,47 +986,47 @@ Only when the user requests and is ready to play:
    - Prove sequenced bidirectional control events and fail-closed gap handling.
    - Record and replay a generated stereo signal offline before opening devices.
 
-1. **Pure domain model**
+1. **Pure domain model — complete**
    - Scale/wake configuration.
    - Note-event model.
    - Command parser and policy.
    - Six-slot state machine.
    - Pure checks for all transitions.
 
-2. **Terminal dashboard**
+2. **Terminal dashboard — complete**
    - Startup keyboard selection.
    - Context-sensitive menu.
    - Pitch event/debug presentation.
    - `--no-tui` and cleanup behavior.
 
-3. **Single-slot PCM engine**
+3. **Single-slot PCM engine — complete offline**
    - Stereo recording buffer.
    - Sample-aligned start/stop.
    - Crossfade and playback.
    - Offline verification first.
 
-4. **Six slots and master cycle**
+4. **Six slots and master cycle — complete offline**
    - One active recorder.
    - Concurrent playback.
    - Queued cycle-boundary transitions.
    - Capacity and clipping checks.
 
-5. **Voice prompts**
+5. **Voice prompts — complete offline**
    - Startup generation/cache.
    - Engine-buffer playback.
    - Prompt-finished events and guards.
    - Microphone/headphone safety.
 
-6. **Destructive operations and shutdown**
+6. **Destructive operations and shutdown — complete offline**
    - Confirmed erase.
    - Confirmed guitar exit.
    - Ctrl+C and engine-failure cleanup.
 
-7. **Live validation**
+7. **Live validation — initial pass complete; follow-up retest pending**
    - Performed only with explicit user participation and low-volume/headphone
      precautions.
 
-## Recommended first implementation target
+## Implemented architecture
 
 Create a new self-contained Jolt/Csound POC. Jolt owns startup configuration,
 the pure control reducer, command policy, voice coordination, dashboard, and

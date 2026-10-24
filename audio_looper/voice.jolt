@@ -1,0 +1,155 @@
+(ns audio-looper.voice
+  "Finite startup-only TTS assets. Speech is played from Csound tables, never say's device output."
+  (:require [audio-looper.wav :as wav]
+            [clojure.java.io :as io]
+            [jolt.process :as process]))
+
+
+(def numbers ["one" "two" "three" "four" "five" "six"])
+(def rejection-text
+  {:transition-pending "Wait for the queued transition."
+   :finalizing "Wait for recording to finish."
+   :clip-exists "A clip already exists. Erase it before recording again."
+   :not-recording "That looper is not recording."
+   :recording-active "Only stop the active recording, or confirm exit."
+   :empty "That looper is empty."
+   :stop-before-erase "Stop playback before erasing the clip."
+   :reserved "Invalid command. That note is reserved."
+   :invalid-loop "Invalid looper selection."
+   :exiting "The looper is exiting."})
+(def noop-text
+  {:already-recording "Already armed or recording."
+   :finalizing "Recording is already finishing."
+   :already-playing "Already playing or queued to start."
+   :already-stopping "Playback is already queued to stop."
+   :already-stopped "Already stopped."})
+(def cancelled-text
+  {:timeout "Command timed out."
+   :no-complete-cycle "Keep recording. No complete cycle was captured."
+   :invalid-operation "Invalid action. Command cancelled."
+   :out-of-tune "Control note is out of tune. Command cancelled."
+   :invalid-selector "Invalid looper note. Command cancelled."
+   :wrong-confirmation "Wrong confirmation note. Nothing changed."
+   :unexpected-note "Unexpected note. Command cancelled."
+   :confirmation-too-short "Hold the confirmation note longer, then release."})
+
+
+(defn phrases
+  []
+  (into {[:ready] "Ready. Select looper."
+         [:exit-confirmation] "Exit? Play the exit note again, hold it, then release."
+         [:exiting] "Exiting."
+         [:command-cancelled] "Command cancelled."
+         [:engine-failure] "Audio engine failure."}
+        (concat
+          (for [id (range 1 7)
+                [prompt tail] {:loop-selected "selected. Select action."
+                               :recording-armed "recording armed. Release the guitar and wait for the cue."
+                               :recording "recording." :recorded "recorded."
+                               :playing "playing." :stopped "stopped."
+                               :erased "erased." :maximum-reached "maximum recording length reached."
+                               :record-cancelled "recording cancelled."}]
+            [[prompt id] (str "Looper " (nth numbers (dec id)) " " tail)])
+          (for [id (range 1 7) action [:playback-start :playback-stop]]
+            [[:playback-queued id action]
+             (str "Looper " (nth numbers (dec id)) " playback queued to "
+                  (if (= action :playback-start) "start." "stop."))])
+          (map (fn [[reason text]] [[:rejected reason] text]) rejection-text)
+          (map (fn [[reason text]] [[:no-op reason] text]) noop-text)
+          (map (fn [[reason text]] [[:command-cancelled reason] text]) cancelled-text))))
+
+
+(defn key-for
+  [{:keys [prompt loop-id operation reason]}]
+  (cond
+    (= :playback-queued prompt) [prompt loop-id operation]
+    (#{:rejected :no-op} prompt) [prompt reason]
+    (= :command-cancelled prompt)
+    (cond (get rejection-text reason) [:rejected reason]
+          (get cancelled-text reason) [prompt reason]
+          :else [prompt])
+    (and loop-id (contains? (phrases) [prompt loop-id])) [prompt loop-id]
+    :else [prompt]))
+
+
+(defn run-child!
+  "An owned, bounded startup/verification child; never a long-lived audio engine."
+  [owner timeout-ms arguments]
+  (let [token (str (System/nanoTime) "-" (count arguments))
+        child (locking owner
+                (when (:closed? @owner) (throw (ex-info "Asset owner is closed." {})))
+                (let [child (apply process/process {:out :string :err :string} arguments)]
+                  (swap! owner assoc-in [:children token] child)
+                  child))]
+    (try
+      (let [result (deref child timeout-ms ::timeout)]
+        (when (or (= result ::timeout) (not (zero? (:exit result))))
+          (throw (ex-info "Owned asset child failed or timed out."
+                          {:type :asset-error :command (first arguments) :detail (:err result)})))
+        result)
+      (finally
+        (when (.isAlive (:proc child)) (process/destroy-tree child) (deref child 2000 nil))
+        (swap! owner update :children dissoc token)))))
+
+
+(defn close!
+  [cache]
+  (locking cache
+    (when-not (:closed? @cache)
+      (doseq [child (vals (:children @cache))]
+        (when (.isAlive (:proc child)) (process/destroy-tree child) (deref child 2000 nil)))
+      (doseq [file (.listFiles (io/file (:directory @cache)))] (.delete file))
+      (.delete (io/file (:directory @cache)))
+      (swap! cache assoc :closed? true)
+      (when-let [hook (:hook @cache)] (.removeShutdownHook (Runtime/getRuntime) hook))))
+  nil)
+
+
+(defn prepare!
+  "Render a finite prompt set before opening audio. Optional selection is for
+  offline checks only; every generated asset is temporary and process-owned."
+  ([] (prepare! nil nil))
+  ([selection created]
+   (let [directory (java.io.File/createTempFile "audio-looper-voice-" ".assets")
+         _ (.delete directory)
+         _ (when-not (.mkdir directory) (throw (ex-info "Cannot create prompt cache." {})))
+         cache (atom {:directory (.getPath directory) :children {} :closed? false :entries []})
+         hook (Thread. (fn [] (close! cache)))]
+     (swap! cache assoc :hook hook)
+     (.addShutdownHook (Runtime/getRuntime) hook)
+     (try
+       (when created (created cache))
+       (let [plans (mapv (fn [[index [key text]]]
+                           {:key key :text text
+                            :file (.getPath (io/file directory (str index ".wav")))
+                            :table (+ 1000 index)})
+                         (map-indexed vector
+                                      (sort-by (comp pr-str first)
+                                               (filter (fn [[key _]] (or (nil? selection) (contains? selection key)))
+                                                       (phrases)))))]
+         ;; `say` startup dominates generation. Four owned children cut the full
+         ;; finite cache from minutes to seconds without an unbounded fan-out.
+         (doseq [batch (partition-all 4 plans)]
+           (let [workers (mapv (fn [{:keys [file text]}]
+                                 (future (run-child! cache 15000
+                                                     ["/usr/bin/say" "--file-format=WAVE"
+                                                      "--data-format=LEF32@44100" "-r" "185"
+                                                      "-o" file text]))) batch)]
+             (doseq [worker workers] @worker)))
+         (doseq [{:keys [key file table]} plans]
+           (let [wave (wav/read! file)]
+             (when-not (and (= 1 (:channels wave)) (= 44100 (:rate wave))
+                            (<= 1 (:frames wave) (* 15 44100)))
+               (throw (ex-info "Invalid generated voice format or duration." {:key key})))
+             (swap! cache update :entries conj
+                    {:key key :file file :frames (:frames wave) :table table}))))
+       cache
+       (catch Exception error (close! cache) (throw error))))))
+
+
+(defn operation
+  [cache effect]
+  (let [key (key-for effect)
+        entry (first (filter #(= key (:key %)) (:entries @cache)))]
+    (when-not entry (throw (ex-info "Prompt was not preloaded." {:key key})))
+    (assoc effect :type :prompt :arg (:table entry))))

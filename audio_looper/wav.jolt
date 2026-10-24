@@ -1,0 +1,48 @@
+(ns audio-looper.wav
+  "Small WAV inspection helpers for offline verification, not the playback path."
+  (:refer-clojure :exclude [chunk])
+  (:require [clojure.java.io :as io]))
+
+
+(defn uint-le
+  [bytes offset length]
+  (reduce (fn [value i]
+            (+ value (* (bit-and 255 (aget bytes (+ offset i))) (bit-shift-left 1 (* 8 i)))))
+          0 (range length)))
+
+
+(defn- chunk
+  [bytes tag]
+  (loop [position 12]
+    (when (> (+ position 8) (alength bytes)) (throw (ex-info "Missing WAV chunk." {:chunk tag})))
+    (let [length (uint-le bytes (+ position 4) 4)
+          name (apply str (map #(char (aget bytes (+ position %))) (range 4)))]
+      (when (> (+ position 8 length) (alength bytes)) (throw (ex-info "Truncated WAV." {})))
+      (if (= name tag) [position length] (recur (+ position 8 length (mod length 2)))))))
+
+
+(defn read!
+  [path]
+  (let [bytes (with-open [stream (io/input-stream path)] (.readAllBytes stream))
+        [fmt _] (chunk bytes "fmt ") [data length] (chunk bytes "data")
+        channels (uint-le bytes (+ fmt 10) 2)
+        bits (uint-le bytes (+ fmt 22) 2)]
+    {:bytes bytes :offset (+ data 8) :frames (/ length (* channels (/ bits 8)))
+     :channels channels :bits bits :rate (uint-le bytes (+ fmt 12) 4)
+     :format (let [tag (uint-le bytes (+ fmt 8) 2)]
+               (if (= tag 65534) (uint-le bytes (+ fmt 32) 2) tag))}))
+
+
+(defn sample
+  [wave frame channel]
+  (when-not (and (<= 0 frame (dec (:frames wave))) (<= 0 channel (dec (:channels wave)))
+                (= 32 (:bits wave)) (= 3 (:format wave)))
+    (throw (ex-info "Expected bounded float32 WAV sample." {:frame frame :channel channel})))
+  (let [offset (+ (:offset wave) (* 4 (+ (* frame (:channels wave)) channel)))
+        bits (uint-le (:bytes wave) offset 4)
+        sign (if (bit-test bits 31) -1.0 1.0)
+        exponent (bit-and 255 (bit-shift-right bits 23))
+        fraction (/ (bit-and bits 8388607) 8388608.0)]
+    (when (= 255 exponent) (throw (ex-info "Non-finite PCM sample." {})))
+    (* sign (if (zero? exponent) fraction (+ 1.0 fraction))
+       (Math/pow 2.0 (- (max 1 exponent) 127)))))

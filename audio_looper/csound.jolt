@@ -1,0 +1,530 @@
+(ns audio-looper.csound
+  "All native bindings for the audio-looper POC. Csound 6.18, Jolt 0.8.10.
+  No C-to-Jolt callbacks, raw channel pointers, per-block host loop, or audio subprocess."
+  (:require
+    [clojure.java.io :as io]
+    [clojure.string :as str]
+    [jolt.ffi :as ffi]
+    [jolt.process :as process]))
+
+
+(def supported-jolt "v0.8.10")
+
+
+(defn- fail!
+  [stage message data]
+  (throw (ex-info message (merge {:type :engine-error :stage stage} data))))
+
+
+(defn- library-path
+  []
+  (or (System/getenv "CSOUND_LIBRARY")
+      (first (filter #(.exists (io/file %))
+                     ["/opt/homebrew/opt/csound/Frameworks/CsoundLib64.framework/CsoundLib64"
+                      "/usr/local/opt/csound/Frameworks/CsoundLib64.framework/CsoundLib64"
+                      "/Library/Frameworks/CsoundLib64.framework/CsoundLib64"]))
+      (fail! :load "Csound 6 framework not found; set CSOUND_LIBRARY." {})))
+
+
+(def ^:private diagnostics-source
+  (.getPath (io/file (or (.getParent (io/file *file*)) ".") "diagnostics.c")))
+
+
+(defn- sndfile-prefix
+  [library]
+  (or (System/getenv "SNDFILE_PREFIX")
+      (first (filter #(.exists (io/file % "include/sndfile.h"))
+                     [(if (str/starts-with? library "/opt/homebrew/") "/opt/homebrew/opt/libsndfile" "")
+                      (if (str/starts-with? library "/usr/local/") "/usr/local/opt/libsndfile" "")
+                      "/opt/homebrew/opt/libsndfile" "/usr/local/opt/libsndfile"]))
+      (fail! :native-bridge "libsndfile headers not found; set SNDFILE_PREFIX." {})))
+
+
+(defn- load-diagnostics!
+  [library]
+  (let [output (java.io.File/createTempFile "audio-looper-diagnostics-" ".dylib")
+        sndfile (sndfile-prefix library)]
+    (try
+      (let [compiler (process/process {:out :string :err :string :shutdown process/destroy-tree}
+                                      "/usr/bin/cc" "-std=c11" "-Wall" "-Wextra" "-Werror"
+                                      "-dynamiclib" "-I"
+                                      (.getPath (io/file (.getParent (io/file library)) "Headers"))
+                                      "-I" (.getPath (io/file sndfile "include"))
+                                      diagnostics-source library (.getPath (io/file sndfile "lib/libsndfile.dylib"))
+                                      "-o" (.getPath output))]
+        (try
+          (let [result (deref compiler 15000 ::timeout)]
+            (when (= ::timeout result)
+              (fail! :native-bridge "Diagnostics compiler timed out." {}))
+            (when-not (zero? (:exit result))
+              (fail! :native-bridge "Cannot compile bounded diagnostics bridge."
+                     {:code (:exit result) :detail (apply str (take 2048 (:err result)))})))
+          (finally
+            (when (.isAlive (:proc compiler))
+              (process/destroy-tree compiler)
+              (deref compiler 2000 nil)))))
+      (ffi/load-library (.getPath output))
+      (finally (.delete output)))))
+
+
+(defn- load-api!
+  []
+  (let [jolt (System/getProperty "jolt.version")]
+    (when-not (= supported-jolt jolt)
+      (fail! :version "Unsupported Jolt version." {:expected supported-jolt :actual jolt}))
+    (let [path (library-path)]
+      (try
+        (ffi/load-library path)
+        (catch Exception e
+          (fail! :load "Cannot load Csound framework." {:library path :cause (ex-message e)})))
+      ;; Resolve version probes before binding ANY instance or MYFLT functions.
+      (let [version ((ffi/foreign-fn "csoundGetVersion" [] :int))
+            api-version ((ffi/foreign-fn "csoundGetAPIVersion" [] :int))
+            sample-bytes ((ffi/foreign-fn "csoundGetSizeOfMYFLT" [] :int))
+            metadata {:jolt jolt :csound version :api api-version
+                      :sample-bytes sample-bytes :library path}]
+        (when-not (and (<= 6180 version 6189) (= 400 api-version) (= 8 sample-bytes))
+          (fail! :version "Requires Csound 6.18, API 4.00, double MYFLT (8 bytes)." metadata))
+        (load-diagnostics! path)
+        {:versions metadata
+         :diagnostics-create (ffi/foreign-fn "looperDiagnosticsCreate" [] :pointer)
+         :diagnostics-attach (ffi/foreign-fn "looperDiagnosticsAttach" [:pointer] :void)
+         :diagnostics-failed (ffi/foreign-fn "looperDiagnosticsFailed" [:pointer] :int)
+         :diagnostics-reset (ffi/foreign-fn "looperDiagnosticsReset" [:pointer] :void)
+         :diagnostics-free (ffi/foreign-fn "looperDiagnosticsFree" [:pointer] :void)
+         :load-mono-table (ffi/foreign-fn "looperLoadMonoTable"
+                                           [:pointer :int :pointer :int] :int :blocking)
+         :initialize (ffi/foreign-fn "csoundInitialize" [:int] :int)
+         :create (ffi/foreign-fn "csoundCreate" [:pointer] :pointer)
+         :compile (ffi/foreign-fn "csoundCompileCsdText" [:pointer :pointer] :int :blocking)
+         :start (ffi/foreign-fn "csoundStart" [:pointer] :int :blocking)
+         :perform (ffi/foreign-fn "csoundPerform" [:pointer] :int :blocking)
+         :stop (ffi/foreign-fn "csoundStop" [:pointer] :void)
+         :cleanup (ffi/foreign-fn "csoundCleanup" [:pointer] :int :blocking)
+         :destroy (ffi/foreign-fn "csoundDestroy" [:pointer] :void :blocking)
+         :get-control (ffi/foreign-fn "csoundGetControlChannel"
+                                      [:pointer :string :pointer] :double)
+         :set-control (ffi/foreign-fn "csoundSetControlChannel"
+                                      [:pointer :string :double] :void)
+         :table-length (ffi/foreign-fn "csoundTableLength" [:pointer :int] :int)
+         :table-get (ffi/foreign-fn "csoundTableGet" [:pointer :int :int] :double)
+         :table-copy-in (ffi/foreign-fn "csoundTableCopyIn" [:pointer :int :pointer] :void :blocking)}))))
+
+
+(def ^:private api (delay (load-api!)))
+
+
+(defn versions
+  []
+  (:versions @api))
+
+
+(defn arm-wall-clock!
+  "Independent OS alarm for the whole foreground host, not audio score time."
+  [seconds]
+  (when-not (and (integer? seconds) (<= 1 seconds 600))
+    (fail! :safety "Wall-clock limit must be 1..600 seconds." {:seconds seconds}))
+  ;; Independent of loading Csound / compiling the bridge: startup is bounded too.
+  ((ffi/foreign-fn "alarm" [:uint] :uint) seconds)
+  nil)
+
+
+(defn- usable!
+  [instance]
+  (let [state @instance]
+    (when (#{:closing :closed} (:phase state))
+      (fail! :lifecycle "Csound instance is closing or destroyed." {}))
+    state))
+
+
+(declare close!)
+
+
+(defn create!
+  "Create an owned instance. A shutdown hook is armed BEFORE the worker starts."
+  []
+  (let [bindings @api
+        ;; Do not let Csound replace Jolt's signal handling or install atexit.
+        initialized ((:initialize bindings) 3)]
+    (when (neg? initialized)
+      (fail! :initialize "Csound initialization failed." {:code initialized}))
+    (let [diagnostics ((:diagnostics-create bindings))]
+      (when (ffi/null? diagnostics)
+        (fail! :create "Diagnostics allocation failed." {}))
+      (let [pointer ((:create bindings) diagnostics)]
+        (when (ffi/null? pointer)
+          ((:diagnostics-free bindings) diagnostics)
+          (fail! :create "Csound allocation failed." {}))
+        ((:diagnostics-attach bindings) pointer)
+        (let [instance (atom {:api bindings :pointer pointer :phase :created
+                              :diagnostics diagnostics :result (promise) :worker nil})
+              hook (Thread. (fn [] (close! instance)))]
+          (swap! instance assoc :hook hook)
+          (.addShutdownHook (Runtime/getRuntime) hook)
+          instance)))))
+
+
+(defn compile!
+  [instance csd]
+  (locking instance
+    (let [{:keys [api pointer phase]} (usable! instance)]
+      (when-not (= :created phase)
+        (fail! :lifecycle "Compile requires a fresh instance." {:phase phase}))
+      ;; :blocking cannot borrow Chez string memory: keep an owned C string
+      ;; alive for the ENTIRE call, including collections on other threads.
+      (with-open [arena (ffi/confined-arena)]
+        (let [text (ffi/string->ptr arena csd)
+              code ((:compile api) pointer text)]
+          (when-not (zero? code)
+            (fail! :compile "Csound compile failed." {:code code}))))
+      (swap! instance assoc :phase :compiled)))
+  instance)
+
+
+(defn prepare!
+  "Initialize score/tables without starting the blocking performance worker."
+  [instance]
+  (locking instance
+    (let [{:keys [api pointer phase]} (usable! instance)]
+      (when-not (= :compiled phase)
+        (fail! :lifecycle "Prepare requires successful compilation." {:phase phase}))
+      (let [code ((:start api) pointer)]
+        (when-not (zero? code)
+          (fail! :start "Csound start failed." {:code code})))
+      (swap! instance assoc :phase :started)))
+  instance)
+
+
+(defn start!
+  "One dedicated OS thread makes ONE blocking csoundPerform call."
+  [instance]
+  (when (= :compiled (:phase @instance)) (prepare! instance))
+  (locking instance
+    (let [{:keys [api pointer phase result diagnostics]} (usable! instance)]
+      (when-not (= :started phase)
+        (fail! :lifecycle "Start requires a prepared instance." {:phase phase}))
+      ;; Csound labels some startup banners as ERROR. Native start's return
+      ;; code validates that phase; latch only PERFORMANCE diagnostics now.
+      ((:diagnostics-reset api) diagnostics)
+      (let [worker (Thread.
+                     (fn []
+                       (deliver result
+                                (try
+                                  {:code ((:perform api) pointer)
+                                   :engine-error? (pos? ((:diagnostics-failed api) diagnostics))}
+                                  (catch Exception e
+                                    {:exception (ex-message e)})))))]
+        (swap! instance assoc :phase :performing :worker worker)
+        (.start worker))))
+  instance)
+
+
+(defn await!
+  [instance timeout-ms]
+  (let [result (deref (:result @instance) timeout-ms ::timeout)]
+    (when (= ::timeout result)
+      (fail! :timeout "Csound performance did not finish in time." {:timeout-ms timeout-ms}))
+    (when (or (:exception result) (:engine-error? result) (neg? (:code result)))
+      (fail! :perform "Csound performance failed." result))
+    result))
+
+
+(defn check-health!
+  "Poll the fixed-size native error latch; no native log/message queue."
+  [instance]
+  (locking instance
+    (let [{:keys [api diagnostics]} (usable! instance)]
+      (when (pos? ((:diagnostics-failed api) diagnostics))
+        (fail! :perform "Csound reported an engine error." {:engine-error? true}))))
+  nil)
+
+
+(defn control
+  "Public thread-safe scalar API, checked out-parameter; never a channel pointer."
+  [instance channel]
+  (locking instance
+    (let [{:keys [api pointer]} (usable! instance)]
+      (with-open [arena (ffi/confined-arena)]
+        (let [error (ffi/alloc arena :int)
+              value ((:get-control api) pointer channel error)
+              code (ffi/read error :int)]
+          (when-not (zero? code)
+            (fail! :channel "Cannot read control channel." {:channel channel :code code}))
+          value)))))
+
+
+(defn set-control!
+  [instance channel value]
+  (when-not (and (number? value) (<= -9007199254740991 value 9007199254740991))
+    (fail! :channel "Control value must be finite and within the exact double integer range."
+           {:channel channel :value value}))
+  (locking instance
+    (let [{:keys [api pointer]} (usable! instance)]
+      ((:set-control api) pointer channel (double value)))))
+
+
+(defn finished?
+  [instance]
+  (realized? (:result @instance)))
+
+
+(defn table-range!
+  "Offline inspection only: never inspect PCM while the native worker runs."
+  [instance table start count]
+  (locking instance
+    (let [{:keys [api pointer worker]} (usable! instance)]
+      (when worker
+        (when-not (finished? instance)
+          (fail! :lifecycle "PCM inspection requires a finished performance." {}))
+        (.join worker 2000)
+        (when (.isAlive worker) (fail! :lifecycle "PCM inspection worker did not join." {})))
+      (let [length ((:table-length api) pointer table)]
+        (when-not (and (integer? start) (integer? count) (<= 0 start) (<= 0 count 65536)
+                       (<= (+ start count) length))
+          (fail! :table "Table access exceeds owned buffer bounds." {:table table :length length}))
+        (mapv #((:table-get api) pointer table %) (range start (+ start count)))))))
+
+
+(defn load-mono-table!
+  "Bulk startup load through libsndfile in the bounded native adapter."
+  [instance table path frames]
+  (locking instance
+    (let [{:keys [api pointer phase]} (usable! instance)]
+      (when-not (= :started phase)
+        (fail! :lifecycle "Prompt loading is allowed only after prepare and before performance." {:phase phase}))
+      (with-open [arena (ffi/confined-arena)]
+        (let [filename (ffi/string->ptr arena path)
+              code ((:load-mono-table api) pointer table filename frames)]
+          (when-not (zero? code)
+            (fail! :assets "Cannot bulk-load validated prompt into its engine table."
+                   {:table table :frames frames :code code}))))))
+  nil)
+
+
+(defn table-copy-in!
+  "Copy one complete double table before performance starts. The temporary native
+  block is arena-owned and remains alive for the whole blocking C copy."
+  [instance table samples]
+  (locking instance
+    (let [{:keys [api pointer phase]} (usable! instance)
+          length ((:table-length api) pointer table)]
+      (when-not (= :started phase)
+        (fail! :lifecycle "Table loading is allowed only after prepare and before performance." {:phase phase}))
+      (when-not (= length (count samples))
+        (fail! :table "Prompt data must exactly fill its engine table."
+               {:table table :expected length :actual (count samples)}))
+      (with-open [arena (ffi/confined-arena)]
+        (let [data (ffi/alloc arena (* 8 length))]
+          (ffi/write-array data :double samples)
+          ((:table-copy-in api) pointer table data)))))
+  nil)
+
+
+(defn request-stop!
+  [instance]
+  (locking instance
+    (let [{:keys [api pointer phase]} (usable! instance)]
+      (when (= :performing phase)
+        ((:stop api) pointer)))))
+
+
+(defn closed?
+  [instance]
+  (= :closed (:phase @instance)))
+
+
+(defn close!
+  "Idempotent. Stop -> join -> cleanup -> destroy. Never free a running engine."
+  [instance]
+  (locking instance
+    (when-not (closed? instance)
+      (let [{:keys [api pointer worker hook diagnostics]} @instance]
+        (swap! instance assoc :phase :closing)
+        (when worker
+          ((:stop api) pointer)
+          (.join worker 2000)
+          (when (.isAlive worker)
+            ;; On a stuck native call, process exit/alarm is the final boundary;
+            ;; freeing the pointer here would be a use-after-free.
+            (fail! :cleanup "Performance worker did not stop; instance NOT destroyed." {})))
+        (try
+          (let [code ((:cleanup api) pointer)]
+            ;; Uncompiled/unstarted instances legitimately return -1 here.
+            (when (and worker (neg? code))
+              (fail! :cleanup "Csound cleanup failed." {:code code})))
+          (finally
+            ((:destroy api) pointer)
+            ((:diagnostics-free api) diagnostics)
+            (swap! instance assoc :phase :closed :pointer nil :diagnostics nil)
+            (.removeShutdownHook (Runtime/getRuntime) hook))))))
+  nil)
+
+
+;; Metadata and terminal syscalls are lazy and independent of libcsound. They
+;; never create an audio stream; keeping these here preserves one FFI boundary.
+(def ^:private property-address
+  (ffi/layout [:struct [[:selector :uint] [:scope :uint] [:element :uint]]]))
+
+
+(def ^:private audio-buffer
+  (ffi/layout [:struct [[:channels :uint] [:bytes :uint] [:data :pointer]]]))
+
+
+(def ^:private buffer-list
+  (ffi/layout [:struct [[:count :uint]
+                        [:buffers [:array [:struct [[:channels :uint] [:bytes :uint] [:data :pointer]]] 1]]]]))
+
+
+(def ^:private device-api
+  (delay
+    (ffi/load-library "/System/Library/Frameworks/CoreAudio.framework/CoreAudio")
+    (ffi/load-library "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+    {:size (ffi/foreign-fn "AudioObjectGetPropertyDataSize" [:uint :pointer :uint :pointer :pointer] :int :blocking)
+     :data (ffi/foreign-fn "AudioObjectGetPropertyData" [:uint :pointer :uint :pointer :pointer :pointer] :int :blocking)
+     :string (ffi/foreign-fn "CFStringGetCString" [:pointer :pointer :long :uint] :bool)
+     :release (ffi/foreign-fn "CFRelease" [:pointer] :void)}))
+
+
+(defn- fourcc
+  [text]
+  (reduce #(+ (* %1 256) (int %2)) 0 text))
+
+
+(defn- property-data
+  [bindings arena object selector scope]
+  (let [address (ffi/alloc arena property-address)
+        size (ffi/alloc arena :uint)]
+    (ffi/write address property-address {:selector (fourcc selector) :scope (fourcc scope) :element 0})
+    (loop [remaining 3]
+      (let [code ((:size bindings) object address 0 ffi/null size)
+            bytes (ffi/read size :uint)]
+        (when-not (and (zero? code) (<= 0 bytes 65536))
+          (fail! :devices "Cannot query bounded CoreAudio property." {:code code :property selector}))
+        (if (zero? bytes)
+          {:pointer ffi/null :size 0}
+          (let [data (ffi/alloc arena bytes)
+                result ((:data bindings) object address 0 ffi/null size data)
+                actual (ffi/read size :uint)]
+            (cond
+              (and (zero? result) (<= actual bytes)) {:pointer data :size actual}
+              (> remaining 1) (recur (dec remaining))
+              :else (fail! :devices "Audio device changed during enumeration; retry selection."
+                           {:code result :property selector}))))))))
+
+
+(defn- device-string
+  [bindings arena object selector]
+  (let [{:keys [pointer size]} (property-data bindings arena object selector "glob")]
+    (when-not (= size (ffi/sizeof :pointer))
+      (fail! :devices "Invalid CoreAudio string property size." {:property selector}))
+    (let [reference (ffi/read pointer :pointer)
+          buffer (ffi/alloc arena 4096)]
+      (when (ffi/null? reference)
+        (fail! :devices "Missing CoreAudio string." {:property selector}))
+      (try
+        (when-not ((:string bindings) reference buffer 4096 134217984)
+          (fail! :devices "Audio device label exceeds UTF-8 limit." {:property selector}))
+        (ffi/ptr->string buffer)
+        (finally ((:release bindings) reference))))))
+
+
+(defn- channel-count
+  [bindings arena object scope]
+  (let [{:keys [pointer size]} (property-data bindings arena object "slay" scope)]
+    (if (zero? size)
+      0
+      (do
+        (when (< size 4) (fail! :devices "Invalid AudioBufferList." {}))
+        (let [count (ffi/read pointer :uint)
+              start (ffi/field-offset buffer-list :buffers)
+              stride (ffi/layout-size audio-buffer)]
+          (when-not (and (<= count 256) (or (zero? count) (<= (+ start (* count stride)) size)))
+            (fail! :devices "AudioBufferList exceeds property bounds." {}))
+          (reduce + (map #(ffi/read-field (+ pointer start (* % stride)) audio-buffer :channels)
+                         (range count))))))))
+
+
+(defn audio-devices!
+  "Read CoreAudio metadata only, with size-checked property buffers and stable UIDs.
+  adcN/dacN numbering matches Csound 6.18's rtauhal filtered device order. Resolve
+  UIDs again immediately before opening a stream; never persist these numbers."
+  []
+  (let [bindings @device-api]
+    (with-open [arena (ffi/confined-arena)]
+      (let [{:keys [pointer size]} (property-data bindings arena 1 "dev#" "glob")
+            _ (when-not (and (zero? (mod size 4)) (<= (/ size 4) 256))
+                (fail! :devices "CoreAudio device inventory exceeds bounds." {}))
+            default-device (fn [selector]
+                             (let [{:keys [pointer size]} (property-data bindings arena 1 selector "glob")]
+                               (when-not (= size 4) (fail! :devices "Invalid default device property." {}))
+                               (ffi/read pointer :uint)))
+            default-in (default-device "dIn ")
+            default-out (default-device "dOut")
+            devices (mapv (fn [i]
+                            (let [id (ffi/read pointer :uint (* i 4))]
+                              {:coreaudio-id id :name (device-string bindings arena id "lnam")
+                               :uid (device-string bindings arena id "uid ")
+                               :input-channels (channel-count bindings arena id "inpt")
+                               :output-channels (channel-count bindings arena id "outp")}))
+                          (range (/ size 4)))
+            direction (fn [field prefix default]
+                        (mapv (fn [i device]
+                                (-> (select-keys device [:uid :name :coreaudio-id])
+                                    (assoc :id (str prefix (inc i)) :channels (get device field)
+                                           :default? (= default (:coreaudio-id device)))))
+                              (range) (filter #(pos? (get % field)) devices)))]
+        {:inputs (direction :input-channels "adc" default-in)
+         :outputs (direction :output-channels "dac" default-out)}))))
+
+
+(def ^:private poll-fd
+  (ffi/layout [:struct [[:fd :int] [:events :short] [:revents :short]]]))
+
+
+(def ^:private window-size
+  (ffi/layout [:struct [[:rows :ushort] [:columns :ushort] [:x :ushort] [:y :ushort]]]))
+
+
+(def ^:private terminal-api
+  (delay
+    {:tty? (ffi/foreign-fn "isatty" [:int] :int)
+     :poll (ffi/foreign-fn "poll" [:pointer :uint :int] :int {:blocking true :capture-native-error true})
+     :read (ffi/foreign-fn "read" [:int :pointer :size_t] :ssize_t {:blocking true :capture-native-error true})
+     :ioctl (ffi/foreign-fn "ioctl" [:int :ulong :& :pointer] :int)}))
+
+
+(defn tty?
+  [descriptor]
+  (== 1 ((:tty? @terminal-api) descriptor)))
+
+
+(defn terminal-size!
+  []
+  (with-open [arena (ffi/confined-arena)]
+    (let [pointer (ffi/alloc arena window-size)
+          request (if (= "Mac OS X" (System/getProperty "os.name")) 1074295912 21523)
+          code ((:ioctl @terminal-api) 1 request pointer)
+          size (ffi/read pointer window-size)]
+      (if (and (zero? code) (pos? (:rows size)) (pos? (:columns size)))
+        size {:columns 100 :rows 40}))))
+
+
+(defn read-key!
+  "Bounded wait on owned stdin. nil=no key, :eof=closed input. No reader buffering."
+  [timeout-ms]
+  (when-not (<= 0 timeout-ms 1000) (fail! :terminal "Invalid input poll timeout." {}))
+  (with-open [arena (ffi/confined-arena)]
+    (let [fd (ffi/alloc arena poll-fd)
+          byte (ffi/alloc arena 1)]
+      (ffi/write fd poll-fd {:fd 0 :events 1 :revents 0})
+      (let [[ready error] ((:poll @terminal-api) fd 1 timeout-ms)]
+        (cond
+          (zero? ready) nil
+          (neg? ready) (when-not (= error 4) (fail! :terminal "stdin poll failed." {:errno error}))
+          :else
+          (let [[count error] ((:read @terminal-api) 0 byte 1)]
+            (cond
+              (pos? count) (char (ffi/read byte :uint8))
+              (zero? count) :eof
+              (#{4 11 35} error) nil
+              :else (fail! :terminal "stdin read failed." {:errno error}))))))))

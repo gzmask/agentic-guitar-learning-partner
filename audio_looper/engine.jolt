@@ -1,0 +1,131 @@
+(ns audio-looper.engine
+  "Bounded sequenced transport and owned embedded engine. No per-block host loop."
+  (:require [audio-looper.csound :as native]
+            [audio-looper.dsp :as dsp]
+            [audio-looper.wav :as wav]))
+
+
+(defn open!
+  [configuration]
+  (let [instance (native/create!)]
+    (try
+      (when-let [created (:on-instance configuration)] (created instance))
+      (native/compile! instance (dsp/document configuration))
+      (native/prepare! instance)
+      (doseq [{:keys [table file frames]} (:prompts configuration)]
+        (let [wave (wav/read! file)]
+          (when-not (and (= 1 (:channels wave)) (= 44100 (:rate wave)) (= frames (:frames wave)))
+            (throw (ex-info "Prompt changed after validation." {:type :engine-error :stage :assets})))
+          (native/load-mono-table! instance table file frames)))
+      (native/start! instance)
+      {:instance instance :configuration configuration
+       :transport (atom {:event-seq 0 :next-seq 1 :in-flight nil :queue [] :held nil :last-note-id 0})}
+      (catch Exception e (native/close! instance) (throw e)))))
+
+
+(defn close!
+  [engine]
+  (native/close! (:instance engine)))
+
+
+(defn enqueue!
+  [engine operation]
+  (when-not (get dsp/operation-codes (:type operation))
+    (throw (ex-info "Unsupported engine operation." {:operation operation})))
+  (swap! (:transport engine)
+         (fn [state]
+           (when (>= (count (:queue state)) 64)
+             (throw (ex-info "Host operation queue overflow." {:type :engine-error :stage :queue})))
+           (update state :queue conj operation)))
+  nil)
+
+
+(defn discard-queued!
+  [engine]
+  (swap! (:transport engine) assoc :queue [])
+  nil)
+
+
+(defn- send-next!
+  [engine]
+  (let [instance (:instance engine)
+        state @(:transport engine)
+        in-flight (:in-flight state)
+        accepted (long (native/control instance "h/ack"))
+        state (if (and in-flight (= accepted (:seq in-flight))) (assoc state :in-flight nil) state)]
+    (if (and (nil? (:in-flight state)) (seq (:queue state)))
+      (let [operation (first (:queue state))
+            sequence (:next-seq state)
+            fields {"h/op" (get dsp/operation-codes (:type operation))
+                    "h/id" (:id operation) "h/slot" (dec (or (:loop-id operation) 1))
+                    "h/at" (or (:at-sample operation) 0) "h/length" (or (:length-samples operation) 0)
+                    "h/arg" (or (:arg operation) 0)}]
+        (doseq [[channel value] fields] (native/set-control! instance channel value))
+        (native/set-control! instance "h/seq" sequence)
+        (reset! (:transport engine) (assoc state :queue (vec (rest (:queue state)))
+                                         :next-seq (inc sequence) :in-flight {:seq sequence})))
+      (reset! (:transport engine) state))))
+
+
+(defn- decode
+  [sequence values]
+  (let [{:strs [type sample id slot a b c d e]} values
+        type (get dsp/event-types (long type))
+        base {:type type :sample (long sample) :seq sequence}
+        id (long id) slot (long slot)]
+    (when-not type (throw (ex-info "Unknown native event type." {:type :engine-error :stage :protocol})))
+    (case type
+      :note-on (merge base {:id id :midi (long a) :onset-sample (long b) :cents c :hz d :db e
+                           :onset-time (/ b 44100.0) :confirm-time (/ sample 44100.0)})
+      :note-off (merge base {:id id :end-sample (long a) :reason (if (== b 1) :silence :pitch-change)})
+      :prompt-finished (assoc base :id id)
+      :record-limit (assoc base :loop-id slot)
+      :mixer-faded (assoc base :operation-id id)
+      (merge base {:loop-id slot :operation-id id}
+             (case type
+               :record-started {:start-sample (long a)}
+               :record-finalized {:length-samples (long a) :offset-samples (long b)
+                                  :buffer [slot id (long b)]}
+               (:playback-started :playback-stopped) {:at-sample (long a)}
+               {})))))
+
+
+(defn poll!
+  "Read clock FIRST, drain the immutable ring through its committed write seq,
+  acknowledge LAST. Events cannot subsequently arrive behind the reducer clock."
+  [engine]
+  (let [instance (:instance engine)]
+    (native/check-health! instance)
+    (let [clock (long (native/control instance "engine/clock"))
+          written (long (native/control instance "e/write"))
+          fatal (long (native/control instance "engine/fatal"))
+          previous (:event-seq @(:transport engine))]
+      (when (pos? fatal)
+        (throw (ex-info "Native DSP rejected an operation or overflowed its bounded event ring."
+                        {:type :engine-error :stage :protocol :code fatal})))
+      (when-not (<= 0 (- written previous) dsp/ring-size)
+        (throw (ex-info "Native event sequence gap." {:type :engine-error :stage :sequence-gap})))
+      (let [events (mapv (fn [sequence]
+                           (let [prefix (str "ev/" (mod sequence dsp/ring-size) "/")
+                                 committed (long (native/control instance (str prefix "seq")))]
+                             (when-not (= sequence committed)
+                               (throw (ex-info "Native event slot is not committed." {:type :engine-error :stage :sequence-gap})))
+                             (decode sequence (into {} (map #(vector % (native/control instance (str prefix %))) dsp/fields)))))
+                         (range (inc previous) (inc written)))
+            hz (native/control instance "pitch/hz")]
+        (swap! (:transport engine)
+               (fn [state]
+                 (reduce (fn [state event]
+                           (case (:type event)
+                             :note-on (assoc state :held event :latest-note event :last-note-id (:id event))
+                             :note-off (cond-> (assoc state :latest-note event)
+                                         (= (:id event) (get-in state [:held :id])) (assoc :held nil))
+                             state))
+                         (assoc state :event-seq written) events)))
+        (native/set-control! instance "e/ack" written)
+        (send-next! engine)
+        {:events events :sample (max clock (or (:sample (last events)) 0))
+         :ended? (native/finished? instance)
+         :pitch {:hz hz :db (native/control instance "pitch/db")
+                 :midi (when (<= 70 hz 1400) (long (native/control instance "pitch/midi")))
+                 :cents (native/control instance "pitch/cents") :gate? (pos? (native/control instance "pitch/gate"))}}))))

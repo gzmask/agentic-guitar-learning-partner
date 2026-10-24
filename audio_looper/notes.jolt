@@ -1,0 +1,67 @@
+(ns audio-looper.notes
+  "Pure reference for the engine's note-event contract, not a host DSP loop.
+  Stage 3 must match these traces in Csound. All timing uses the audio sample clock.")
+
+
+(def sample-rate 44100)
+(def confirmation-samples 2426)
+(def release-samples 5292)
+
+
+(defn initial-state
+  []
+  {:sample -1 :gate? false :gate-open -44.0 :candidate nil :active nil :next-id 1
+   :silent-since nil})
+
+
+(defn- pitch
+  [hz]
+  (when (and (number? hz) (<= 70.0 hz 1400.0))
+    (let [value (+ 69.0 (* 12.0 (/ (Math/log (/ hz 440.0)) (Math/log 2.0))))
+          midi (long (Math/floor (+ value 0.5)))]
+      {:midi midi :cents (* 100.0 (- value midi))})))
+
+
+(defn- note-off
+  [active sample end-sample reason]
+  {:type :note-off :id (:id active) :sample sample :end-sample end-sample
+   :time (/ end-sample (double sample-rate))
+   :duration (/ (- end-sample (:onset-sample active)) (double sample-rate))
+   :reason reason})
+
+
+(defn step
+  "One timestamped native-analysis estimate -> [reference-state note-events].
+  Silence ends at its estimated onset, not 120ms later when release is known."
+  [state {:keys [sample hz db]}]
+  (when-not (and (integer? sample) (> sample (:sample state))
+                 (number? db) (<= -300 db 100) (number? hz) (<= 0 hz 1e9))
+    (throw (ex-info "Invalid or non-monotonic pitch estimate." {:type :invalid-estimate})))
+  (let [gate? (if (:gate? state) (> db (- (:gate-open state) 6.0))
+                  (> db (:gate-open state)))
+        label (when gate? (pitch hz))
+        state (assoc state :sample sample :gate? gate?)
+        active (:active state)]
+    (if label
+      (let [candidate (:candidate state)
+            candidate (if (and (= (:midi label) (:midi candidate))
+                               (<= (- sample (:last-sample candidate)) 2205))
+                        (assoc candidate :last-sample sample)
+                        (assoc label :onset-sample sample :last-sample sample))
+            state (assoc state :candidate candidate :silent-since nil)
+            confirmed? (and (>= (- sample (:onset-sample candidate)) confirmation-samples)
+                            (not= (:midi label) (:midi active)))]
+        (if confirmed?
+          (let [onset (:onset-sample candidate)
+                on (merge label {:type :note-on :id (:next-id state) :sample sample
+                                 :onset-sample onset :onset-time (/ onset (double sample-rate))
+                                 :confirm-time (/ sample (double sample-rate)) :hz hz :db db})
+                events (cond-> [] active (conj (note-off active sample onset :pitch-change))
+                               true (conj on))]
+            [(assoc state :active on :next-id (inc (:next-id state))) events])
+          [state []]))
+      (let [since (or (:silent-since state) sample)
+            state (assoc state :candidate nil :silent-since since)]
+        (if (and active (>= (- sample since) release-samples))
+          [(assoc state :active nil) [(note-off active sample since :silence)]]
+          [state []])))))

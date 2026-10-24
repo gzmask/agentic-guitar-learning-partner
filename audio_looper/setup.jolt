@@ -1,0 +1,172 @@
+(ns audio-looper.setup
+  "Pure keyboard/device selection and confirmed-note configuration capture."
+  (:require
+    [audio-looper.control :as control]
+    [clojure.string :as str]))
+
+
+(defn initial-state
+  [inventory]
+  (let [output (first (filter :default? (:outputs inventory)))]
+    {:stage (if (and (seq (:inputs inventory)) output) :input :error)
+     :inventory inventory :input nil :output output :profile nil
+     :monitor? false :headphones? false :sample 0 :last-note-id 0 :held nil
+     :scale [] :wake [] :silence nil
+     :message (when (or (empty? (:inputs inventory)) (nil? output))
+                "Input or default output unavailable; no device will be opened.")}))
+
+
+(defn- whole-number?
+  [value]
+  (and (number? value) (<= 0 value 9007199254740991) (== value (long value))))
+
+
+(defn- normalize-event
+  [event]
+  (reduce (fn [result field]
+            (let [value (get result field)]
+              (if (whole-number? value) (assoc result field (long value)) result)))
+          event [:id :midi :sample :onset-sample :end-sample]))
+
+
+(defn- capture-note
+  [state {:keys [id midi] :as event}]
+  (if (or (not (whole-number? id)) (<= id (:last-note-id state))
+          (not (integer? midi)) (:held state))
+    state
+    (let [stage (:stage state)
+          field (if (= :scale stage) :scale :wake)
+          state (-> state (assoc :last-note-id id :held {:id id :midi midi
+                                                         :onset (or (:onset-sample event) (:sample event))} :silence nil)
+                    (update field conj midi))]
+      (try
+        (cond
+          (and (= :scale stage) (= 8 (count (:scale state))))
+          (let [tonic (peek (:scale state))]
+            (control/profile (:scale state) [tonic tonic tonic])
+            (assoc state :stage :wake :wake [] :message nil))
+          (and (= :wake stage) (> (count (:wake state)) 6))
+          (assoc state :wake [] :message "Wake must contain 3..6 notes; try again.")
+          :else state)
+        (catch Exception _
+          (assoc state field [] :message "Invalid ascending scale/register; play all eight notes again."))))))
+
+
+(defn step
+  "Custom setup receives confirmed engine notes after input is selected/opened.
+  Preview never invents notes or opens that input. Enter accepts the wake review."
+  [state event]
+  (let [event (normalize-event event)
+        {:keys [type text sample id reason end-sample]} event
+        clock? (#{:note-on :note-off :tick} type)
+        valid-clock? (and (whole-number? sample) (<= (:sample state) sample 26460000))
+        state (if (and clock? valid-clock?) (assoc state :sample sample) state)
+        text (str/trim (or text ""))
+        stage (:stage state)]
+    (cond
+      (and clock? (not valid-clock?)) (step state {:type :gap})
+      (and (= :line type) (= "q" text)) (assoc state :stage :quit)
+      (and (= :line type) (= "c" text))
+      (if (and (:input state) (or (not (:headphones-required? state)) (:headphones? state)))
+        (assoc state :stage :profile :scale [] :wake [] :held nil)
+        (assoc state :message "Select an input and confirm headphones before configuring."))
+      (and (= :line type) (= :input stage))
+      (if-let [index (when (re-matches #"[0-9]+" text) (parse-long text))]
+        (if (<= 1 index (count (get-in state [:inventory :inputs])))
+          (let [input (nth (get-in state [:inventory :inputs]) (dec index))
+                line? (str/includes? (str/lower-case (:name input)) "fx100")]
+            (assoc state :input input :monitor? line? :headphones? false :headphones-required? (not line?)
+                   :profile control/default-profile
+                   :stage (if line? :ready :headphones) :message nil))
+          (assoc state :message "Select a device from the current list."))
+        (assoc state :message "Enter the input's list number, or q."))
+      (and (= :line type) (= :headphones stage))
+      (if (= "y" (str/lower-case text))
+        (assoc state :headphones? true :monitor? false :profile control/default-profile
+               :stage :ready :message nil)
+        (assoc state :message "Headphones are required; type y to confirm or q to quit."))
+      (and (= :line type) (= :profile stage))
+      (case text
+        ("" "1") (assoc state :profile control/default-profile :stage :ready :message nil)
+        "2" (assoc state :stage :scale :scale [] :wake [] :held nil :message nil)
+        (assoc state :message "Enter selects C major; 2 selects guitar-driven custom capture."))
+      (and (= :line type) (= :review stage))
+      (case text
+        "" (assoc state :stage :ready :message nil)
+        "r" (assoc state :stage :wake :wake [] :silence nil :profile nil)
+        (assoc state :message "Enter accepts, r repeats wake capture, q quits."))
+      (and (= :gap type) (#{:scale :wake :review} stage))
+      (assoc state :stage (if (= :scale stage) :scale :wake)
+             (if (= :scale stage) :scale :wake) [] :held nil :silence nil
+             :message "Lost note event; capture reset. Play the phrase again.")
+      (and (= :note-on type) (#{:scale :wake} stage)) (capture-note state event)
+      (= :note-off type)
+      (if (and (:held state) (= id (get-in state [:held :id])))
+        (if (and (whole-number? end-sample) (<= (get-in state [:held :onset]) end-sample sample))
+          (assoc state :held nil :silence (when (= :silence reason) end-sample))
+          (step state {:type :gap})) state)
+      (and (= :tick type) (= :wake stage) (:silence state)
+           (nil? (:held state)) (>= (- (:sample state) (:silence state)) 44100)
+           (seq (:wake state)))
+      (try
+        (assoc state :stage :review :profile (control/profile (:scale state) (:wake state)) :message nil)
+        (catch Exception _
+          (assoc state :wake [] :silence nil :message "Wake must be 3..6 scale notes; play it again.")))
+      :else state)))
+
+
+(defn prompt
+  ([state] (prompt state false))
+  ([state live-capture?]
+   (let [output (str "Output: " (get-in state [:output :name] "unavailable"))
+         message (:message state)
+         capture-help (if live-capture?
+                        "LIVE CAPTURE: play clean single notes; c returns to defaults, q quits."
+                        "OFFLINE PREVIEW: detector is not connected; c returns to defaults, q quits.")]
+    (vec (concat
+           ["AUDIO LOOPER SETUP (no audio stream opened by this UI)" output]
+           (case (:stage state)
+             :input (concat ["Input device:"]
+                            (map-indexed #(str (inc %1) ". " (:name %2) " [" (:channels %2) " channels]")
+                                         (get-in state [:inventory :inputs]))
+                            ["> Enter the list number (q quits)."])
+             :headphones ["Microphone/unknown input: raw monitoring is OFF."
+                          "Use headphones to prevent acoustic feedback. Headphones connected? [y/N]"]
+             :profile ["Control setup:" "1. C major; wake = C5 D5 C5 D5 [default]"
+                       "2. Capture custom scale and wake with the guitar" "> [Enter]"]
+             :scale [(str "Play ascending scale + octave (8 notes): " (:scale state))
+                     capture-help]
+             :wake [(str "Play a 3..6-note wake, then one second of silence: " (:wake state))
+                    capture-help]
+             :review [(str "Wake pitches: " (get-in state [:profile :wake :midi]))
+                      (str "Degrees: " (get-in state [:profile :wake :degrees]))
+                      "Enter accepts; r captures again; q quits."]
+             :ready ["Setup ready."] :quit ["Cancelled."] :error ["No safe device selection available."] [])
+           (when message [message]))))))
+
+
+(defn resolve-session
+  "Re-resolve volatile adcN/dacN identifiers by stable CoreAudio UID at startup."
+  [state current]
+  (when-not (= :ready (:stage state))
+    (throw (ex-info "Setup is incomplete." {:type :incomplete-setup})))
+  (when (and (:headphones-required? state) (not (:headphones? state)))
+    (throw (ex-info "Microphone/unknown input requires explicit headphone confirmation."
+                    {:type :headphones-required})))
+  (let [resolve-one (fn [direction chosen]
+                      (let [matches (filter #(= (:uid chosen) (:uid %)) (get current direction))]
+                        (when-not (= 1 (count matches))
+                          (throw (ex-info "Selected device disappeared or is ambiguous; select again."
+                                          {:type :device-unavailable :uid (:uid chosen)})))
+                        (first matches)))]
+    {:input (resolve-one :inputs (:input state)) :output (resolve-one :outputs (:output state))
+     :profile (:profile state) :monitor? (and (:monitor? state) (not (:headphones-required? state)))
+     :headphones? (:headphones? state)}))
+
+
+(defn reconfigurable?
+  [state]
+  (and (= :running (:status state)) (nil? (:active-recorder state)) (nil? (:voice state))
+       (= :dormant (get-in state [:parser :phase])) (empty? (get-in state [:parser :tokens]))
+       (every? #(and (= :empty (:clip-state %)) (= :idle (:record-state %))
+                     (= :stopped (:play-state %)) (nil? (:pending %))) (:slots state))))

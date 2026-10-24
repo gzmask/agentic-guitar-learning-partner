@@ -1,0 +1,493 @@
+(ns audio-looper.control-checks
+  "Small deterministic checks for stage 1; no engine, devices, or test dependency."
+  (:refer-clojure :exclude [send])
+  (:require
+    [audio-looper.control :as control]
+    [audio-looper.notes :as notes]))
+
+
+(defn- check!
+  [label condition]
+  (when-not condition
+    (throw (ex-info (str "Control check failed: " label) {:check label}))))
+
+
+(defn- rejected-profile?
+  [scale wake]
+  (try (control/profile scale wake) false (catch Exception _ true)))
+
+
+(defn- event
+  [state type sample attributes]
+  (merge {:type type :sample sample :seq (inc (:event-seq state))} attributes))
+
+
+(defn- send
+  [state type sample attributes]
+  (control/step state (event state type sample attributes)))
+
+
+(defn- on
+  [state midi sample]
+  (send state :note-on sample {:id (inc (:last-note-id state)) :midi midi :cents 0.0
+                               :onset-sample (max 0 (- sample 2500))}))
+
+
+(defn- off
+  [state sample]
+  (send state :note-off sample {:id (get-in state [:held :id])
+                                :end-sample (- sample 5292) :reason :silence}))
+
+
+(defn- note
+  [state midi]
+  (let [[state effects] (on state midi (+ (:sample state) 8000))
+        [state released] (off state (+ (:sample state) 8000))]
+    [state (into effects released)]))
+
+
+(defn- settle
+  "Finish logical prompts/guards and cooldowns; never acknowledges audio effects."
+  [state]
+  (loop [state state remaining 20]
+    (check! "settle is bounded" (pos? remaining))
+    (cond
+      (= :speaking (get-in state [:voice :state]))
+      (recur (first (send state :prompt-finished (+ (:sample state) 1000)
+                          {:id (get-in state [:voice :id])})) (dec remaining))
+
+      (= :guard (get-in state [:voice :state]))
+      (recur (first (control/step state {:type :tick :sample (get-in state [:voice :until])}))
+             (dec remaining))
+
+      (= :cooldown (get-in state [:parser :phase]))
+      (recur (first (control/step state {:type :tick :sample (get-in state [:parser :until])}))
+             (dec remaining))
+
+      (seq (:notifications state))
+      (recur (first (control/step state {:type :tick :sample (:sample state)})) (dec remaining))
+
+      :else state)))
+
+
+(defn- wake
+  [state]
+  (reduce (fn [s midi] (first (note s midi))) state (get-in state [:profile :wake :midi])))
+
+
+(defn- select-loop
+  [state id]
+  (let [state (settle (wake (settle state)))]
+    (settle (first (note state (nth (get-in state [:profile :selectors]) (dec id)))))))
+
+
+(defn- command
+  [state id degree]
+  (note (select-loop state id) (nth (get-in state [:profile :operations]) (dec degree))))
+
+
+(defn- ready-state
+  []
+  (-> (control/initial-state)
+      (assoc :master {:origin-sample 0 :length-samples 44100})
+      (assoc-in [:slots 0] (merge (control/empty-slot 1)
+                                  {:clip-state :ready :buffer :pcm-one :length-samples 44100}))))
+
+
+(defn- check-profiles!
+  []
+  (let [p control/default-profile
+        custom (control/profile [62 64 65 67 69 70 72 74] [74 77 74])]
+    (check! "default registers" (= [60 62 64 65 67 69 71] (:selectors p)))
+    (check! "operation register" (= [72 74 76 77 79 81 83] (:operations p)))
+    (check! "default wake degrees" (= [1 2 1 2] (get-in p [:wake :degrees])))
+    (check! "custom degrees" (= [1 3 1] (get-in custom [:wake :degrees])))
+    (check! "custom FFI pitches normalize"
+            (= (dissoc p :name)
+               (control/profile [60.0 62.0 64.0 65.0 67.0 69.0 71.0 72.0]
+                                [72.0 74.0 72.0 74.0])))
+    (check! "selector matching is octave-independent" (= 1 (control/degree p :selector 72)))
+    (check! "selector/action resolve the same pitch class by parser phase"
+            (= [1 1] [(control/degree p :selector 60) (control/degree p :operation 72)]))
+    (check! "high custom scale keeps supported action references"
+            (= [72 74 76 77 79 81 83]
+               (:operations (control/profile [72 74 76 77 79 81 83 84] [84 86 84]))))
+    (doseq [[scale wake] [[[60 62 64 65 67 69 71] [72 74 72]]
+                          [[60 62 62 65 67 69 71 72] [72 74 72]]
+                          [[60 62 64 65 67 69 71 73] [72 74 72]]
+                          [[60 62 64 65 67 69 71 72] [72 73 72]]
+                          [[60 62 64 65 67 69 71 72] [72 74]]]]
+      (check! "invalid custom setup rejected" (rejected-profile? scale wake)))))
+
+
+(defn- check-detector!
+  []
+  (let [hz (fn [midi] (* 440.0 (Math/pow 2.0 (/ (- midi 69) 12.0))))
+        sample (fn [n midi db] {:sample n :hz (hz midi) :db db})
+        run (fn [samples]
+              (reduce (fn [[state events] estimate]
+                        (let [[state emitted] (notes/step state estimate)]
+                          [state (into events emitted)]))
+                      [(notes/initial-state) []] samples))
+        [_ held] (run (mapv #(sample % 60 -20) (range 0 88201 441)))
+        [_ repeated] (run (concat (map #(sample % 60 -20) (range 0 8820 441))
+                                  (map #(sample % 60 -80) (range 8820 15876 441))
+                                  (map #(sample % 60 -20) (range 15876 24696 441))))
+        [_ changed] (run (concat (map #(sample % 60 -20) (range 0 8820 441))
+                                 (map #(sample % 72 -20) (range 8820 17640 441))))
+        [_ flutter] (run (concat (map #(sample % 60 -20) (range 0 8820 441))
+                                 (map #(sample % 60 -80) (range 8820 10143 441))
+                                 (map #(sample % 60 -20) (range 10143 22050 441))))]
+    (check! "held pitch emits one token" (= [:note-on] (mapv :type held)))
+    (check! "onset differs from confirmation"
+            (< (:onset-sample (first held)) (:sample (first held))))
+    (check! "released repeated pitch emits two tokens"
+            (= [:note-on :note-off :note-on] (mapv :type repeated)))
+    (check! "direct octave change has explicit lifecycle"
+            (= [60 72] (mapv :midi (filter #(= :note-on (:type %)) changed))))
+    (check! "short gate flutter cannot retrigger" (= 1 (count flutter)))))
+
+
+(defn- check-parser!
+  []
+  (let [initial (control/initial-state)
+        woken (wake initial)
+        paused (first (on woken 60 (+ (:sample woken) 100)))
+        wait-loop (settle woken)
+        selected (select-loop initial 1)
+        [armed effects] (on selected 72 (+ (:sample selected) 8000))]
+    (check! "wake fully consumed" (empty? (get-in woken [:parser :tokens])))
+    (check! "wake announces before listening" (= :speaking (get-in woken [:voice :state])))
+    (check! "prompt ignores premature selector" (nil? (get-in paused [:parser :loop-id])))
+    (check! "timeout starts after prompt and guard"
+            (= (+ (:sample wait-loop) 176400) (get-in wait-loop [:parser :deadline])))
+    (check! "C4 selector -> C5 operation" (= :armed (get-in armed [:slots 0 :record-state])))
+    (check! "arming does not start PCM early" (not-any? #(= :record-start (:type %)) effects))
+    (check! "one active recorder" (= 1 (:active-recorder armed)))
+    (let [[selected-across-octave _] (on wait-loop 84 (+ (:sample wait-loop) 8000))]
+      (check! "loop selector accepts another octave"
+              (= 1 (get-in selected-across-octave [:parser :loop-id]))))
+    (let [[across-octave _] (on (select-loop initial 1) 60 (+ (:sample selected) 8000))]
+      (check! "action accepts another octave" (= :armed (get-in across-octave [:slots 0 :record-state]))))
+    (let [timed (first (control/step wait-loop {:type :tick
+                                                :sample (get-in wait-loop [:parser :deadline])}))]
+      (check! "timeout clears tokens" (empty? (get-in timed [:parser :tokens]))))
+    (let [prefix (reduce (fn [s midi] (first (note s midi))) initial [72 74 72])
+          recovered (reduce (fn [s midi] (first (note s midi))) prefix [72 74 72 74])]
+      (check! "wake prefix/suffix recovery" (= :speaking (get-in recovered [:voice :state]))))
+    (let [transposed (reduce (fn [s midi] (first (note s midi))) initial [60 74 48 86])]
+      (check! "wake accepts mixed octaves" (= :speaking (get-in transposed [:voice :state]))))
+    (let [[bad _] (on initial 72 8000)
+          bad (first (off bad 16000))
+          [bad _] (send bad :note-on 24000 {:id 2 :midi 74 :cents 36.0 :onset-sample 21500})]
+      (check! "cents tolerance enforced" (empty? (get-in bad [:parser :tokens]))))
+    (let [gap (first (control/step selected {:type :note-on :sample (+ (:sample selected) 1)
+                                             :seq (+ (:event-seq selected) 2)
+                                             :id 99 :midi 72 :cents 0 :onset-sample 0}))]
+      (check! "sequence gap cancels command without arming"
+              (and (empty? (get-in gap [:parser :tokens])) (nil? (:active-recorder gap)))))
+    (let [[same _] (control/step selected {:type :note-on :sample (:sample selected)
+                                           :seq (:event-seq selected) :id 99 :midi 72})]
+      (check! "duplicate engine event is ignored" (= selected same)))
+    (let [[cancelled _] (on selected 83 (+ (:sample selected) 8000))
+          state (settle cancelled)
+          suffix (reduce (fn [s midi] (first (note s midi))) state [74 72 74])]
+      (check! "cancelled command suffix cannot seed next wake" (nil? (:voice suffix))))))
+
+
+(defn- check-policy!
+  []
+  (doseq [[clip record play expected]
+          [[:empty :idle :stopped [:enabled :disabled :disabled :no-op :disabled]]
+           [:empty :armed :stopped [:no-op :enabled :disabled :disabled :disabled]]
+           [:empty :recording :stopped [:no-op :enabled :disabled :disabled :disabled]]
+           [:empty :finalizing :stopped [:disabled :no-op :disabled :disabled :disabled]]
+           [:ready :idle :stopped [:disabled :disabled :enabled :no-op :enabled]]
+           [:ready :idle :playing [:disabled :disabled :no-op :enabled :disabled]]
+           [:ready :idle :queued-start [:disabled :disabled :no-op :disabled :disabled]]
+           [:ready :idle :queued-stop [:disabled :disabled :disabled :no-op :disabled]]]]
+    (let [state (assoc-in (control/initial-state) [:slots 0]
+                          (merge (control/empty-slot 1)
+                                 {:clip-state clip :record-state record :play-state play}))
+          actual (mapv #(cond (not (:enabled? %)) :disabled (:no-op? %) :no-op :else :enabled)
+                       (take 5 (control/operation-menu state 1)))]
+      (check! (str "complete operation matrix: " clip "/" record "/" play) (= expected actual))))
+  (doseq [clip [:empty :ready]
+          record [:idle :armed :recording :finalizing]
+          play [:stopped :queued-start :playing :queued-stop]]
+    (let [slot (merge (control/empty-slot 1)
+                      {:clip-state clip :record-state record :play-state play})
+          state (assoc-in (control/initial-state) [:slots 0] slot)
+          menu (control/operation-menu state 1)]
+      (check! "menu is exactly policy data"
+              (= menu (mapv #(control/policy state 1 %) (range 1 8))))
+      (check! "reserved operations disabled" (every? #(false? (:enabled? %)) (drop 5 menu)))
+      (when (or (= :ready clip) (not= :idle record) (not= :stopped play))
+        (check! "no clip overwrite" (not (and (:enabled? (first menu))
+                                              (not (:no-op? (first menu)))))))
+      (when (or (not= :ready clip) (not= :idle record) (not= :stopped play))
+        (check! "erase only ready/stopped"
+                (false? (:enabled? (nth menu 4)))))))
+  (let [playing (assoc-in (ready-state) [:slots 0 :play-state] :playing)]
+    (check! "playback start is idempotent" (:no-op? (control/policy playing 1 3)))
+    (check! "playing erase disabled" (false? (:enabled? (control/policy playing 1 5))))
+    (check! "ready record disabled" (false? (:enabled? (control/policy (ready-state) 1 1))))))
+
+
+(defn- check-recording!
+  []
+  (let [[armed _] (command (control/initial-state) 1 1)
+        armed (settle armed)
+        request (get-in armed [:slots 0 :pending])
+        [recording _] (send armed :record-started (+ (:sample armed) 32)
+                            {:loop-id 1 :operation-id (:id request)
+                             :start-sample (:at-sample request)})
+        recording (settle recording)
+        [stopping stop-effects] (command recording 1 2)
+        request (get-in stopping [:slots 0 :pending])
+        [ready _] (send stopping :record-finalized (+ (:sample stopping) 32)
+                        {:loop-id 1 :operation-id (:id request) :buffer :pcm-one
+                         :length-samples (:length-samples request)})]
+    (check! "prompt guard schedules recording" (= :record-start (:type (get-in armed [:slots 0 :pending]))))
+    (check! "engine ack starts recording" (= :recording (get-in recording [:slots 0 :record-state])))
+    (check! "other slot rejected while recording"
+            (every? #(false? (:enabled? %)) (control/operation-menu recording 2)))
+    (check! "recording allows active-slot stop" (:enabled? (control/policy recording 1 2)))
+    (check! "stop uses wake onset, not confirmation"
+            (= (get-in stopping [:parser :wake-onset]) (:boundary-sample request)))
+    (check! "first clip asks the native engine for outer-silence trimming"
+            (= 1 (:arg (first (filter #(= :record-finalize (:type %)) stop-effects)))))
+    (check! "take stays unpublished during finalization"
+            (= :empty (get-in stopping [:slots 0 :clip-state])))
+    (check! "only engine ack publishes PCM buffer"
+            (= :pcm-one (get-in ready [:slots 0 :buffer])))
+    (check! "first clip establishes master period"
+            (= (:length-samples request) (get-in ready [:master :length-samples])))
+    (check! "recorder released after finalization" (nil? (:active-recorder ready)))
+    (let [offset 441
+          length (- (:length-samples request) 882)
+          [trimmed _] (send stopping :record-finalized (+ (:sample stopping) 32)
+                            {:loop-id 1 :operation-id (:id request) :buffer :trimmed-pcm
+                             :offset-samples offset :length-samples length})]
+      (check! "first clip accepts bounded native silence trim"
+              (and (= length (get-in trimmed [:slots 0 :length-samples]))
+                   (= (+ (:start-sample (get-in stopping [:slots 0])) offset)
+                      (get-in trimmed [:master :origin-sample])))))
+    (let [[duplicate effects] (command (settle ready) 1 1)]
+      (check! "duplicate record cannot overwrite" (= :pcm-one (get-in duplicate [:slots 0 :buffer])))
+      (check! "rejected record emits no PCM write" (not-any? #(= :record-start (:type %)) effects)))
+    (let [synced (-> recording
+                     (assoc :master {:origin-sample 0 :length-samples 44100})
+                     (assoc-in [:slots 0 :start-sample] 88200))
+          [stop effects] (command synced 1 2)
+          boundary (get-in stop [:slots 0 :pending :boundary-sample])]
+      (check! "synchronized later clips retain the shared cycle"
+              (= 0 (:arg (first (filter #(= :record-finalize (:type %)) effects)))))
+      (check! "later stop quantizes at/before wake onset"
+              (and (zero? (mod boundary 44100))
+                   (<= boundary (get-in stop [:parser :wake-onset])))))))
+
+
+(defn- check-destructive!
+  []
+  (let [[erasing effects] (command (ready-state) 1 5)
+        pending (get-in erasing [:slots 0 :pending])
+        [erased _] (send erasing :buffer-erased (+ (:sample erasing) 32)
+                         {:loop-id 1 :operation-id (:id pending)})]
+    (check! "erase command immediately requests the selected native buffer"
+            (and (= :await-engine (get-in erasing [:parser :phase]))
+                 (some #(= :buffer-erase (:type %)) effects)))
+    (check! "erase remains unpublished until the matching engine acknowledgement"
+            (= :pcm-one (get-in erasing [:slots 0 :buffer])))
+    (check! "erase publishes empty after engine acknowledgement"
+            (= :empty (get-in erased [:slots 0 :clip-state])))
+    (check! "last erased clip resets master" (nil? (:master erased))))
+  (let [wait-loop (settle (wake (control/initial-state)))
+        [request _] (note wait-loop 71)
+        waiting (settle request)
+        [held _] (on waiting 71 (+ (:sample waiting) 8000))
+        [exiting _] (off held (+ (:sample held) 44100))
+        exiting (settle exiting)]
+    (check! "single exit token does not exit" (= :running (:status request)))
+    (check! "exit waits for a held release" (= :running (:status held)))
+    (check! "confirmed exit begins graceful shutdown" (= :exiting (:status exiting)))
+    (check! "exit ramp is at least 30ms" (>= (get-in exiting [:shutdown :duration-samples]) 1323))))
+
+
+(defn- check-playback!
+  []
+  (let [[queued effects] (command (ready-state) 1 3)
+        pending (get-in queued [:slots 0 :pending])
+        [playing _] (send queued :playback-started (max (:sample queued) (:at-sample pending))
+                          {:loop-id 1 :operation-id (:id pending) :at-sample (:at-sample pending)})
+        [stopping _] (command playing 1 4)
+        stop (get-in stopping [:slots 0 :pending])
+        [stopped _] (send stopping :playback-stopped (max (:sample stopping) (:at-sample stop))
+                          {:loop-id 1 :operation-id (:id stop) :at-sample (:at-sample stop)})]
+    (check! "start is queued, not immediately playing" (= :queued-start (get-in queued [:slots 0 :play-state])))
+    (check! "play queue is a native effect" (some #(= :play-queue (:type %)) effects))
+    (check! "queued playback is on the master boundary" (zero? (mod (:at-sample pending) 44100)))
+    (check! "start ack changes play state" (= :playing (get-in playing [:slots 0 :play-state])))
+    (check! "stop waits for its boundary" (= :queued-stop (get-in stopping [:slots 0 :play-state])))
+    (check! "stop retains PCM" (= :pcm-one (get-in stopped [:slots 0 :buffer])))
+    (check! "stop ack changes play state" (= :stopped (get-in stopped [:slots 0 :play-state])))
+    (let [[duplicate effects] (command queued 1 3)]
+      (check! "duplicate queued start keeps operation id" (= pending (get-in duplicate [:slots 0 :pending])))
+      (check! "duplicate queued start emits no second operation"
+              (not-any? #(= :play-queue (:type %)) effects))))
+  (let [six (assoc (ready-state) :slots
+                   (mapv (fn [id]
+                           (merge (control/empty-slot id)
+                                  {:clip-state :ready :buffer id :length-samples (* id 44100)}))
+                         (range 1 7)))
+        playing (reduce (fn [state id]
+                          (let [[state _] (command state id 3)
+                                pending (get-in state [:slots (dec id) :pending])]
+                            (first (send state :playback-started (max (:sample state) (:at-sample pending))
+                                         {:loop-id id :operation-id (:id pending) :at-sample (:at-sample pending)}))))
+                        six (range 1 7))]
+    (check! "six generic slots can play concurrently" (every? #(= :playing (:play-state %)) (:slots playing)))
+    (check! "six-player policy does not attach track types" (not-any? :track-type (:slots playing)))))
+
+
+(defn- check-boundaries!
+  []
+  (let [selected (select-loop (control/initial-state) 1)
+        [held _] (on selected 72 (+ (:sample selected) 8000))
+        [guarded _] (send held :prompt-finished (+ (:sample held) 1000)
+                          {:id (get-in held [:voice :id])})
+        [waiting effects] (control/step guarded {:type :tick :sample (get-in guarded [:voice :until])})
+        [released _] (off waiting (+ (:sample waiting) 8000))
+        [timed _] (control/step waiting {:type :tick :sample (+ (:sample waiting) control/command-window)})]
+    (check! "held startup command cannot enter PCM buffer"
+            (and (= :arm-release (get-in waiting [:parser :phase]))
+                 (not-any? #(= :record-start (:type %)) effects)))
+    (check! "recording begins only after command silence"
+            (= :record-start (get-in released [:slots 0 :pending :type])))
+    (check! "release timeout disarms without publishing a take"
+            (and (nil? (:active-recorder timed)) (= :empty (get-in timed [:slots 0 :clip-state])))))
+  (let [[armed _] (command (control/initial-state) 1 1)
+        [guarded _] (send armed :prompt-finished (+ (:sample armed) 1000)
+                          {:id (get-in armed [:voice :id])})
+        now (+ (get-in guarded [:voice :until]) 44100)
+        [queued _] (control/step guarded {:type :tick :sample now})]
+    (check! "delayed host never schedules recording in the past"
+            (<= now (get-in queued [:slots 0 :pending :at-sample]))))
+  (let [[armed _] (command (ready-state) 2 1)
+        [guarded _] (send armed :prompt-finished (+ (:sample armed) 1000)
+                          {:id (get-in armed [:voice :id])})
+        now (get-in guarded [:voice :until])
+        [queued _] (control/step guarded {:type :tick :sample now})
+        at (get-in queued [:slots 1 :pending :at-sample])
+        [cancelled _] (command queued 2 2)]
+    (check! "later recording starts strictly on next shared boundary"
+            (and (> at now) (zero? (mod at 44100)) (< (- at now) 44101)))
+    (check! "armed recorder can be cancelled without publishing a take"
+            (and (= :record-cancel (get-in cancelled [:slots 1 :pending :type]))
+                 (= :empty (get-in cancelled [:slots 1 :clip-state])))))
+  (let [recording (-> (control/initial-state)
+                      (assoc :sample 100000 :active-recorder 1)
+                      (assoc-in [:slots 0 :record-state] :recording)
+                      (assoc-in [:slots 0 :start-sample] 0))
+        [limit _] (send recording :record-limit control/capacity-samples {:loop-id 1})
+        pending (get-in limit [:slots 0 :pending])
+        [complete _] (send limit :record-finalized (+ (:sample limit) 32)
+                           {:loop-id 1 :operation-id (:id pending) :buffer :max-pcm
+                            :length-samples (:length-samples pending)})
+        [bad _] (send limit :record-finalized (+ (:sample limit) 32)
+                      {:loop-id 1 :operation-id (:id pending) :buffer :bad
+                       :length-samples (inc (:length-samples pending))})
+        [early _] (send recording :record-limit 100032 {:loop-id 1})]
+    (check! "maximum is bounded to allocated capacity" (= control/capacity-samples (:length-samples pending)))
+    (check! "maximum still waits for finalization ack" (= :empty (get-in limit [:slots 0 :clip-state])))
+    (check! "maximum finalization can publish complete take" (= :ready (get-in complete [:slots 0 :clip-state])))
+    (check! "invalid engine length cannot publish partial PCM"
+            (and (= :failed (:status bad)) (= :empty (get-in bad [:slots 0 :clip-state]))))
+    (check! "premature maximum event fails closed" (= :failed (:status early)))))
+
+
+(defn- check-confirmation-guards!
+  []
+  (let [two (assoc-in (ready-state) [:slots 1]
+                      (merge (control/empty-slot 2)
+                             {:clip-state :ready :buffer :pcm-two :length-samples 88200}))
+        [erasing _] (command two 1 5)
+        pending (get-in erasing [:slots 0 :pending])
+        [erased _] (send erasing :buffer-erased (+ (:sample erasing) 32)
+                         {:loop-id 1 :operation-id (:id pending)})]
+    (check! "erase affects only selected slot" (= :pcm-two (get-in erased [:slots 1 :buffer])))
+    (check! "master survives erasure of its original slot" (= (:master two) (:master erased))))
+  (let [waiting (settle (first (note (settle (wake (control/initial-state))) 71)))
+        [held _] (on waiting 71 (+ (:sample waiting) 8000))
+        exiting (settle (first (off held (+ (:sample held) 44100))))
+        [early _] (send exiting :mixer-faded (+ (:sample exiting) 32)
+                        {:operation-id (get-in exiting [:shutdown :id])})
+        [stale effects] (send exiting :mixer-faded (+ (:sample exiting) 32) {:operation-id 99999})
+        [stopped exit-effects] (send stale :mixer-faded (+ (:sample stale) 1323)
+                                     {:operation-id (get-in stale [:shutdown :id])})]
+    (check! "premature fade completion fails closed" (= :failed (:status early)))
+    (check! "wrong fade completion cannot exit" (and (= :exiting (:status stale)) (empty? effects)))
+    (check! "owned fade completion permits accurate exit"
+            (and (= :stopped (:status stopped)) (= 0 (:exit-code (first exit-effects)))))))
+
+
+(defn- check-safety!
+  []
+  (let [initial (control/initial-state)
+        [unsolicited effects] (send initial :mixer-faded 32 {})
+        [floating _] (control/step initial {:type :note-on :seq 1.0 :sample 8000.0
+                                            :onset-sample 5500.0 :id 1.0 :midi 72.0 :cents 0.0})
+        [empty-off _] (send initial :note-off 32 {:id nil :end-sample 0})
+        [bad-clock _] (control/step initial {:type :tick :sample -1})]
+    (check! "unsolicited mixer event cannot exit" (and (= :running (:status unsolicited)) (empty? effects)))
+    (check! "native double integers normalize at boundary" (= 72 (get-in floating [:held :midi])))
+    (check! "unmatched note-off is harmless" (= :running (:status empty-off)))
+    (check! "invalid clock fails closed" (= :failed (:status bad-clock))))
+  (let [prefix (first (note (control/initial-state) 72))
+        expired (first (control/step prefix {:type :tick :sample (+ (:sample prefix) control/command-window 1)}))]
+    (check! "wake prefix expires even without a new note" (empty? (get-in expired [:parser :tokens]))))
+  (let [[armed _] (command (control/initial-state) 1 1)
+        [guarded _] (send armed :prompt-finished (+ (:sample armed) 1000) {:id (get-in armed [:voice :id])})
+        until (get-in guarded [:voice :until])
+        [duplicate _] (send guarded :prompt-finished (inc (:sample guarded)) {:id (get-in guarded [:voice :id])})
+        [quit effects] (control/step guarded {:type :quit :sample until})
+        [quit-again repeated] (control/step quit {:type :quit :sample (inc until)})
+        [failed error-effects] (send guarded :engine-error until {})]
+    (check! "duplicate prompt completion cannot extend guard" (= until (get-in duplicate [:voice :until])))
+    (check! "repeated safe quit cannot restart the fade"
+            (and (empty? repeated) (= (:shutdown quit) (:shutdown quit-again))))
+    (check! "quit never executes an expired recording-arm action"
+            (and (= :exiting (:status quit)) (not-any? #(= :record-start (:type %)) effects)))
+    (check! "engine failure never executes a recording-arm action"
+            (and (= :failed (:status failed)) (= [:exit] (mapv :type error-effects))))
+    (let [[gap effects] (control/step armed {:type :note-on :sample (inc (:sample armed))
+                                             :seq (+ 2 (:event-seq armed)) :id 99 :midi 72
+                                             :cents 0 :onset-sample 0})]
+      (check! "gap cancels an armed but undispatched take"
+              (and (nil? (:active-recorder gap)) (= :idle (get-in gap [:slots 0 :record-state]))))
+      (check! "prompt cancellation has a fresh effect id"
+              (> (:id (first effects)) (:effect-seq armed)))))
+  (let [bounded (reduce (fn [state i]
+                          (first (send state :note-on (* i 4410)
+                                       {:id i :midi (if (even? i) 50 51) :cents 0
+                                        :onset-sample (- (* i 4410) 2500)})))
+                        (control/initial-state) (range 1 101))]
+    (check! "semantic log and pitch history stay bounded"
+            (and (= 32 (count (:log bounded))) (= 12 (count (:note-history bounded)))))))
+
+
+(defn check-control!
+  []
+  (doseq [[label check] [["scale/wake profiles" check-profiles!]
+                         ["reference note lifecycle" check-detector!]
+                         ["wake/parser/prompt guards" check-parser!]
+                         ["policy/menu state matrix" check-policy!]
+                         ["record/finalize policy" check-recording!]
+                         ["direct erase and confirmed exit" check-destructive!]
+                         ["six-slot playback policy" check-playback!]
+                         ["synchronization/capacity" check-boundaries!]
+                         ["erase isolation and exit completion" check-confirmation-guards!]
+                         ["fail-closed safety/bounds" check-safety!]]]
+    (check)
+    (println "PASS" label))
+  (println "Pure control checks complete; no engine loaded."))

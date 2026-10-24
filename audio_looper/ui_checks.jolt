@@ -1,0 +1,144 @@
+(ns audio-looper.ui-checks
+  "Stage-2 checks use immutable snapshots and synthetic setup events, never audio."
+  (:require
+    [audio-looper.control :as control]
+    [audio-looper.dashboard :as dashboard]
+    [audio-looper.setup :as setup]
+    [clojure.string :as str]))
+
+
+(def inventory
+  {:inputs [{:uid "fx" :id "adc2" :name "Fx100" :channels 2}
+            {:uid "mic" :id "adc3" :name "Mac microphone" :channels 1}]
+   :outputs [{:uid "phones" :id "dac4" :name "Headphones" :channels 2 :default? true}]})
+
+
+(defn- verify!
+  [label value]
+  (when-not value (throw (ex-info (str "UI check failed: " label) {:check label}))))
+
+
+(defn- configured
+  []
+  (-> (setup/initial-state inventory)
+      (setup/step {:type :line :text "1"})
+      (setup/step {:type :line :text ""})))
+
+
+(defn- check-setup!
+  []
+  (let [ready (configured)
+        microphone (-> (setup/initial-state inventory)
+                       (setup/step {:type :line :text "2"}))
+        cancelled (setup/step microphone {:type :line :text ""})
+        mic-ready (-> microphone (setup/step {:type :line :text "y"})
+                      (setup/step {:type :line :text ""}))
+        fresh (assoc-in inventory [:inputs 0 :id] "adc9")]
+    (verify! "line input proceeds directly with the default profile"
+             (and (= :ready (:stage ready)) (= control/default-profile (:profile ready))))
+    (verify! "line input selected by current list" (= "fx" (get-in ready [:input :uid])))
+    (verify! "microphone requires headphones" (= :headphones (:stage microphone)))
+    (verify! "microphone defaults to no software monitoring" (false? (:monitor? microphone)))
+    (verify! "configure key cannot bypass headphone confirmation"
+             (= :headphones (:stage (setup/step microphone {:type :line :text "c"}))))
+    (verify! "ready status alone cannot bypass headphone consent"
+             (try (setup/resolve-session (assoc microphone :stage :ready :profile control/default-profile) inventory)
+                  false (catch Exception e (= :headphones-required (:type (ex-data e))))))
+    (verify! "empty headphone answer is not consent" (= :headphones (:stage cancelled)))
+    (verify! "microphone can finish with explicit confirmation"
+             (and (= :ready (:stage mic-ready)) (:headphones? mic-ready) (not (:monitor? mic-ready))))
+    (verify! "volatile device number resolved again by UID"
+             (= "adc9" (get-in (setup/resolve-session ready fresh) [:input :id])))
+    (verify! "resolved session preserves the selected control profile"
+             (= control/default-profile (:profile (setup/resolve-session ready fresh))))
+    (verify! "unplugged input is not silently replaced"
+             (try (setup/resolve-session ready (assoc inventory :inputs [])) false
+                  (catch Exception e (= :device-unavailable (:type (ex-data e)))))))
+  (let [custom (-> (setup/initial-state inventory)
+                   (setup/step {:type :line :text "1"})
+                   (assoc :stage :profile)
+                   (setup/step {:type :line :text "2"}))
+        scale (reduce (fn [state [id midi]]
+                        (-> state
+                            (setup/step {:type :note-on :id id :midi midi :sample (* id 10000)})
+                            (setup/step {:type :note-off :id id :reason :silence
+                                         :end-sample (+ (* id 10000) 1000) :sample (+ (* id 10000) 6292)})))
+                      custom (map vector (range 1 9) [62 64 65 67 69 70 72 74]))
+        wake (reduce (fn [state [id midi]]
+                       (-> state
+                           (setup/step {:type :note-on :id id :midi midi :sample (* id 10000)})
+                           (setup/step {:type :note-off :id id :reason :silence
+                                        :end-sample (+ (* id 10000) 1000) :sample (+ (* id 10000) 6292)})))
+                     scale [[9 74] [10 77] [11 74]])
+        reviewing (setup/step wake {:type :tick :sample 155101})
+        ready (setup/step reviewing {:type :line :text ""})]
+    (let [floating (setup/step custom {:type :note-on :id 1.0 :midi 62.0 :sample 10000.0})
+          reset (setup/step scale {:type :gap})]
+      (verify! "native double pitches normalize in setup" (= [62] (:scale floating)))
+      (verify! "lost event resets the captured wake" (and (= :wake (:stage reset)) (empty? (:wake reset)))))
+    (verify! "ascending scale transitions to wake capture" (= :wake (:stage scale)))
+    (verify! "wake not accepted before silence" (= :wake (:stage wake)))
+    (verify! "one second silence leads to review" (= :review (:stage reviewing)))
+    (verify! "custom wake displays degree mapping" (= [1 3 1] (get-in reviewing [:profile :wake :degrees])))
+    (verify! "review requires keyboard acceptance" (= :ready (:stage ready)))
+    (verify! "live custom capture is not mislabeled as offline"
+             (some #(str/starts-with? % "LIVE CAPTURE:") (setup/prompt scale true)))))
+
+
+(defn- check-dashboard!
+  []
+  (let [state (-> (control/initial-state)
+                  (assoc :parser {:phase :wait-operation :loop-id 1 :tokens [] :deadline 44100})
+                  (assoc-in [:slots 0] (merge (control/empty-slot 1)
+                                              {:clip-state :ready :buffer :pcm :length-samples 44100})))
+        context {:input (first (:inputs inventory)) :output (first (:outputs inventory))
+                 :preview? true :columns 100 :rows 45 :debug? false}
+        snapshot (dashboard/view state context)
+        rendered (dashboard/render snapshot)
+        [renderer frame] (dashboard/plan (dashboard/renderer true) snapshot 0)
+        [same unchanged] (dashboard/plan renderer snapshot 1000)
+        changed (assoc snapshot :phase "WAIT_LOOP")
+        [throttled early] (dashboard/plan same changed 50)
+        [_ late] (dashboard/plan throttled changed 100)]
+    (verify! "menu is policy, not a renderer copy" (= (control/navigation state) (:options snapshot)))
+    (doseq [text ["OFFLINE PREVIEW" "Fx100" "Headphones" "LOOPERS" "PITCH" "AVAILABLE" "EVENTS"]]
+      (verify! (str "required dashboard section: " text) (str/includes? rendered text)))
+    (verify! "all six slots are visible" (= 6 (count (:slots snapshot))))
+    (let [queued (-> state
+                     (assoc :parser {:phase :dormant :tokens []} :sample 10)
+                     (assoc-in [:slots 0 :play-state] :queued-start)
+                     (assoc-in [:slots 0 :pending] {:type :playback-start :id 1 :at-sample 10}))
+          [playing _] (control/step queued {:type :playback-started :sample 10 :seq 1
+                                            :operation-id 1 :loop-id 1 :at-sample 10})
+          cycle (first (:slots (dashboard/view (assoc playing :sample 88210) context)))]
+      (verify! "playback acknowledgement retains cycle origin" (= 10 (get-in playing [:slots 0 :play-start-sample])))
+      (verify! "displayed cycles use actual playback origin" (= 3 (:cycle cycle))))
+    (verify! "first ANSI frame exists" (str/includes? frame "\u001b["))
+    (verify! "unchanged snapshot is not redrawn" (nil? unchanged))
+    (verify! "less than 100ms is throttled" (nil? early))
+    (verify! "latest state rendered at 10fps" (str/includes? late "WAIT_LOOP"))
+    (let [unsafe (dashboard/render (dashboard/view state (assoc-in context [:input :name] "Fx\u001b[2J\nBAD")))]
+      (verify! "device labels cannot inject terminal controls"
+               (and (not (str/includes? unsafe "\u001b")) (not (str/includes? unsafe "Fx\n")))))
+    (let [compact (dashboard/render (dashboard/view state (assoc context :columns 100 :rows 24)))]
+      (doseq [text ["LOOPERS" "PITCH" "AVAILABLE" "Keyboard" "EVENTS" "6  EMPTY"]]
+        (verify! (str "24-row dashboard retains " text) (str/includes? compact text))))
+    (let [narrow (dashboard/render (dashboard/view state (assoc context :columns 40 :rows 40)))]
+      (verify! "narrow terminal has bounded lines" (every? #(< (count %) 40) (str/split-lines narrow))))
+    (let [[renderer line] (dashboard/plan (dashboard/renderer false) snapshot 0)
+          [_ no-raw] (dashboard/plan renderer (assoc snapshot :pitch "different raw estimate") 100)
+          [_ no-note-spam] (dashboard/plan renderer (assoc snapshot :event "note-on id=99"
+                                                           :events ["0.1s note-on"]) 100)]
+      (verify! "line output has no ANSI" (not (str/includes? line "\u001b")))
+      (verify! "raw pitch changes do not spam default logs" (nil? no-raw))
+      (verify! "raw note events do not print indistinguishable state lines" (nil? no-note-spam)))
+    (verify! "cannot reconfigure a nonempty take" (not (setup/reconfigurable? state)))
+    (verify! "can configure idle empty session" (setup/reconfigurable? (control/initial-state)))))
+
+
+(defn check-ui!
+  []
+  (check-setup!)
+  (println "PASS setup/device identity/custom capture/headphone policy")
+  (check-dashboard!)
+  (println "PASS dashboard/policy menu/10fps/plain logs/terminal sanitization"))

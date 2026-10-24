@@ -1,0 +1,299 @@
+#!/usr/bin/env jolt
+;; Stages 0–6 implementation; live audio starts only after explicit --live input selection.
+(require '[clojure.java.io :as io])
+
+
+;; Jolt 0.8.10 load-file leaves the last loaded namespace current.
+(let [entry-namespace (ns-name *ns*)]
+  (doseq [source ["notes.jolt" "control.jolt" "control_checks.jolt" "csound.jolt"
+                  "wav.jolt" "dsp.jolt" "engine.jolt" "voice.jolt" "runtime.jolt"
+                  "runtime_checks.jolt" "setup.jolt" "dashboard.jolt" "ui_checks.jolt" "engine_checks.jolt"
+                  "terminal.jolt"]]
+    (load-file (.getPath (io/file (or (.getParent (io/file *file*)) ".")
+                                  "audio_looper" source))))
+  (in-ns entry-namespace))
+
+
+(require '[audio-looper.csound :as engine])
+(require '[audio-looper.control-checks :as checks])
+(require '[audio-looper.ui-checks :as ui-checks])
+(require '[audio-looper.engine-checks :as engine-checks])
+(require '[audio-looper.runtime-checks :as runtime-checks])
+(require '[audio-looper.terminal :as terminal])
+
+
+(defn verify!
+  [label condition]
+  (when-not condition
+    (throw (ex-info (str "Check failed: " label) {:type :check-failed :check label}))))
+
+
+(defn expect-error!
+  [stage f]
+  (let [result (try (f) nil (catch Exception e (ex-data e)))]
+    (verify! (str "structured " (name stage) " failure")
+             (and (= :engine-error (:type result)) (= stage (:stage result))))))
+
+
+(defn document
+  [options orchestra score]
+  (str "<CsoundSynthesizer>\n<CsOptions>\n-d -m0 " options
+       "\n</CsOptions>\n<CsInstruments>\n"
+       "sr = 44100\nksmps = 32\nnchnls = 2\n0dbfs = 1\n"
+       orchestra "\n</CsInstruments>\n<CsScore>\n" score
+       "\ne\n</CsScore>\n</CsoundSynthesizer>\n"))
+
+
+;; A one-entry mailbox in each direction: payload first, sequence last, then
+;; immutable until acknowledged. Backpressure never blocks the audio thread.
+;; These are transport probes, NOT the application's semantic state machine.
+(def control-orchestra
+  "chn_k \"host/seq\", 1
+chn_k \"host/value\", 1
+chn_k \"host/event-ack\", 1
+chn_k \"engine/seq\", 2
+chn_k \"engine/op\", 2
+chn_k \"engine/value\", 2
+chn_k \"engine/applied\", 2
+chn_k \"engine/sample\", 2
+
+instr 1
+  klast init 0
+  kseq init 0
+  kapplied init 0
+  ksample init 0
+  khost chnget \"host/seq\"
+  kack chnget \"host/event-ack\"
+  if khost > klast && kack == kseq then
+    kvalue chnget \"host/value\"
+    if khost == klast + 1 then
+      kapplied = kapplied + 1
+      kresult = kvalue
+    else
+      ; A missing host operation is rejected, never guessed or applied.
+      kresult = -1
+    endif
+    chnset kresult, \"engine/value\"
+    klast = khost
+    chnset khost, \"engine/op\"
+    chnset kapplied, \"engine/applied\"
+    kseq = kseq + 1
+    chnset kseq, \"engine/seq\"
+  endif
+  ksample = ksample + ksmps
+  chnset ksample, \"engine/sample\"
+endin")
+
+
+(defn wait-for!
+  [label predicate]
+  (let [deadline (+ (System/nanoTime) 2000000000)]
+    (loop []
+      (cond
+        (predicate) true
+        (> (System/nanoTime) deadline)
+        (throw (ex-info (str "Timed out: " label) {:type :check-timeout}))
+        :else (do (Thread/sleep 10) (recur))))))
+
+
+(defn check-control!
+  []
+  (let [instance (engine/create!)]
+    (try
+      (engine/compile! instance (document "-n" control-orchestra "i 1 0 600\nf 0 600"))
+      (engine/start! instance)
+      (wait-for! "performance worker running"
+                 #(pos? (engine/control instance "engine/sample")))
+      (let [before (engine/control instance "engine/sample")]
+        ;; Deliberate allocations while the native worker is inside Perform.
+        (dotimes [_ 20] (dorun (map str (range 2000))))
+        (wait-for! "audio progresses while host allocates"
+                   #(> (engine/control instance "engine/sample") before)))
+      (doseq [sequence (range 1 9)]
+        (engine/set-control! instance "host/value" (* sequence 10))
+        (engine/set-control! instance "host/seq" sequence)
+        (wait-for! "engine event" #(== sequence (engine/control instance "engine/seq")))
+        (verify! "operation sequence round-trip"
+                 (== sequence (engine/control instance "engine/op")))
+        (verify! "payload round-trip"
+                 (== (* sequence 10) (engine/control instance "engine/value")))
+        ;; Payload must not be consumed while the result is unacknowledged.
+        (engine/set-control! instance "host/value" -999)
+        (Thread/sleep 10)
+        (verify! "duplicate operation is not executed twice"
+                 (== sequence (engine/control instance "engine/applied")))
+        (verify! "unacknowledged result is immutable"
+                 (== (* sequence 10) (engine/control instance "engine/value")))
+        (when (< sequence 8)
+          (engine/set-control! instance "host/value" (* (inc sequence) 10))
+          (engine/set-control! instance "host/seq" (inc sequence))
+          (let [before (engine/control instance "engine/sample")]
+            (wait-for! "audio continues under mailbox backpressure"
+                       #(> (engine/control instance "engine/sample") before)))
+          (verify! "slow consumer cannot lose its result"
+                   (== sequence (engine/control instance "engine/seq"))))
+        (engine/set-control! instance "host/event-ack" sequence))
+      ;; Deliberately skip one host operation. The engine rejects the gap.
+      (engine/set-control! instance "host/seq" 10)
+      (wait-for! "host gap rejected" #(== 9 (engine/control instance "engine/seq")))
+      (verify! "gap did not execute operation"
+               (== 8 (engine/control instance "engine/applied")))
+      (verify! "host gap has an explicit error result"
+               (== -1 (engine/control instance "engine/value")))
+      (engine/request-stop! instance)
+      (verify! "stop joins performance worker" (map? (engine/await! instance 2000)))
+      (finally (engine/close! instance)))
+    (verify! "destroyed instance" (engine/closed? instance))
+    (engine/close! instance)
+    (expect-error! :lifecycle #(engine/control instance "engine/sample"))))
+
+
+;; Source is generated only in instrument 2. Instrument 3 can only replay the
+;; recorded L/R PCM tables. No pitch detector, MIDI, or synthesized replacement.
+;; This stage-0 fixture is block-aligned; arbitrary sample boundaries, trimming,
+;; fades and six-slot mixing still belong to the later PCM engine stages.
+(def pcm-orchestra
+  "giLeft ftgen 0, 0, -4096, -2, 0
+giRight ftgen 0, 0, -4096, -2, 0
+instr 2
+  setksmps 1
+  aleft oscils 0.2, 220, 0
+  aright oscils 0.13, 370, 0
+  aindex line 0, p3, 4096
+  tablew aleft, aindex, giLeft
+  tablew aright, aindex, giRight
+  outs aleft, aright
+endin
+instr 3
+  setksmps 1
+  aindex line 0, p3, 4096
+  aleft table aindex, giLeft
+  aright table aindex, giRight
+  outs aleft, aright
+endin")
+
+
+(defn uint-le
+  [bytes offset length]
+  (reduce (fn [value i]
+            (+ value (* (bit-and 255 (aget bytes (+ offset i)))
+                        (bit-shift-left 1 (* 8 i)))))
+          0 (range length)))
+
+
+(defn float32-le
+  [bytes offset]
+  (let [bits (uint-le bytes offset 4)
+        sign (if (bit-test bits 31) -1.0 1.0)
+        exponent (bit-and 255 (bit-shift-right bits 23))
+        fraction (/ (bit-and bits 8388607) 8388608.0)]
+    (verify! "finite PCM" (< exponent 255))
+    (* sign (if (zero? exponent) fraction (+ 1.0 fraction))
+       (Math/pow 2.0 (- (max 1 exponent) 127)))))
+
+
+(defn chunk-offset
+  [bytes id]
+  (loop [offset 12]
+    (verify! (str "WAV chunk " id) (<= (+ offset 8) (alength bytes)))
+    (let [size (uint-le bytes (+ offset 4) 4)
+          tag (apply str (map #(char (aget bytes (+ offset %))) (range 4)))]
+      (verify! "bounded WAV chunk" (<= (+ offset 8 size) (alength bytes)))
+      (if (= id tag)
+        offset
+        (recur (+ offset 8 size (mod size 2)))))))
+
+
+(defn check-pcm!
+  []
+  (let [file (java.io.File/createTempFile "audio-looper-" ".wav")]
+    (try
+      (let [instance (engine/create!)]
+        (try
+          (engine/compile! instance
+                           (document (str "-W -f -o \"" (.getPath file) "\"") pcm-orchestra
+                                     (str "i 2 0 [4096/44100]\n"
+                                          "i 3 [4096/44100] [4096/44100]\n"
+                                          "f 0 [8192/44100]")))
+          (engine/start! instance)
+          (engine/await! instance 2000)
+          ;; Cleanup flushes the WAV header before inspecting it.
+          (engine/close! instance)
+          (let [bytes (with-open [input (io/input-stream file)] (.readAllBytes input))
+                fmt (+ 8 (chunk-offset bytes "fmt "))
+                chunk (chunk-offset bytes "data")
+                data (+ 8 chunk)
+                frames (/ (uint-le bytes (+ chunk 4) 4) 8)]
+            (verify! "float32 WAV" (= 3 (uint-le bytes fmt 2)))
+            (verify! "stereo WAV" (= 2 (uint-le bytes (+ fmt 2) 2)))
+            (verify! "44.1 kHz WAV" (= 44100 (uint-le bytes (+ fmt 4) 4)))
+            (verify! "complete reference and replay" (== 8192 frames))
+            (doseq [frame (range 4096) channel (range 2)]
+              (let [reference (float32-le bytes (+ data (* frame 8) (* channel 4)))
+                    replay (float32-le bytes (+ data (* (+ frame 4096) 8) (* channel 4)))]
+                (verify! "PCM replay preserves every stereo sample" (= reference replay))
+                (verify! "no clipping" (< (Math/abs replay) 0.21))))
+            (verify! "channels are distinct"
+                     (not= (float32-le bytes (+ data 800))
+                           (float32-le bytes (+ data 804)))))
+          (finally (engine/close! instance))))
+      (finally (.delete file)))))
+
+
+(defn check-failures!
+  []
+  (doseq [[stage csd]
+          [[:compile (document "-n" "this is not an orchestra" "f 0 0.1")]
+           [:start (document "-W -f -o /dev/null/missing.wav"
+                             "instr 1\nendin" "i 1 0 0.1")]
+           [:perform (document "-n"
+                               (str "instr 1\n"
+                                    "aL, aR diskin2 \"/dev/null/missing.wav\", 1, 0, 0\n"
+                                    "outs aL, aR\nendin")
+                               "i 1 0 0.1")]]]
+    (let [instance (engine/create!)]
+      (try
+        (expect-error! stage #(do (engine/compile! instance csd)
+                                  (engine/start! instance)
+                                  (engine/await! instance 2000)))
+        (finally (engine/close! instance)))
+      (verify! (str (name stage) " failure destroyed instance") (engine/closed? instance)))))
+
+
+(defn check!
+  []
+  (println "Stages 0–6 offline checks; no audio devices are opened.")
+  (engine/arm-wall-clock! 600)
+  (checks/check-control!)
+  (ui-checks/check-ui!)
+  (runtime-checks/check-runtime!)
+  (engine-checks/check-engine!)
+  (prn (engine/versions))
+  (check-control!)
+  (println "PASS blocking worker, public channels, sequenced mailboxes, stop/destroy")
+  (check-pcm!)
+  (println "PASS generated stereo PCM record/replay (every float32 sample, no clipping)")
+  (check-failures!)
+  (println "PASS structured engine failure and cleanup"))
+
+
+(try
+  (let [no-tui? (boolean (some #{"--no-tui"} *command-line-args*))
+        arguments (vec (remove #{"--no-tui"} *command-line-args*))]
+    (case arguments
+      ["--check"] (check!)
+      ["--check-control"] (checks/check-control!)
+      ["--check-ui"] (ui-checks/check-ui!)
+      ["--check-runtime"] (runtime-checks/check-runtime!)
+      ["--check-engine"] (do (engine/arm-wall-clock! 600) (engine-checks/check-engine!))
+      ["--devices"] (do (engine/arm-wall-clock! 600) (terminal/list-devices!))
+      ["--live"] (terminal/live! no-tui?)
+      ([] ["--preview"]) (terminal/preview! no-tui?)
+      ["--help"] (println "Default/--preview: keyboard input selection and OFFLINE dashboard; NO audio stream.\n--live: foreground live PCM looper; selecting input starts default C-major control after prompt preparation.\n--no-tui: plain output; redirected preview prints once.\n--devices: current CoreAudio names, stable UIDs and volatile identifiers.\n--check-control / --check-ui / --check-runtime / --check-engine: offline checks.\n--check: all offline checks including embedded API/PCM/TTS. Only --live opens audio devices.")
+      (throw (ex-info "Unknown options; use --help."
+                      {:type :usage}))))
+  (catch Exception e
+    (binding [*out* *err*]
+      (println (ex-message e))
+      (prn (ex-data e)))
+    (System/exit 1)))
