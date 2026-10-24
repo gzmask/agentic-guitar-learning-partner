@@ -247,8 +247,8 @@ Only `--live` can open audio. It requires a foreground TTY and fresh UID-based
 device resolution. Selecting the input is the only mandatory keyboard setup;
 that selection starts finite prompt preparation and then opens the engine, with
 a low-volume/headphone warning but no redundant `LIVE` text confirmation. An
-initial FX100 hardware pass completed end-to-end record/playback and is driving
-iterative control/mix improvements.
+multiple FX100 hardware passes completed end-to-end record/playback and drove
+iterative control, trimming, TUI, and mix improvements.
 
 Device enumeration reads CoreAudio metadata without opening a stream. Selection
 retains stable CoreAudio UIDs and re-resolves volatile `adcN`/`dacN` identifiers;
