@@ -1,86 +1,84 @@
 # Agentic guitar learning partner — agent instructions
 
-## Repository layout and scope
+## Goal and repository layout
 
 Read `README.md` first.
 
-- `song.carp` and `song.jolt` at the repository root are the canonical,
-  self-contained Carp/Jolt implementations of the same two-minute arrangement.
-- `poc/` contains every experimental detector, looper, comparison script, and
-  the hardened guitar-controlled PCM looper. Keep new experiments there rather
-  than adding more scripts or generated artifacts at the repository root.
-- `poc/guitar-audio-looper.jolt` is the entry point for the current six-slot PCM
-  looper; its separated implementation modules live in `poc/audio_looper/`.
-- `poc/AUDIO_LOOPER_PLAN.md` is the looper design and verification record.
-- Do not depend on or edit the old sibling Jolt checkout.
-- Do not add services, daemons, controllers, REPL/nREPL workflows, dependency
-  manifests, build tasks, or a generic benchmark/test framework unless explicitly
-  requested. There are no `bb play/stop/status/test` tasks.
+The production focus is the guitar-controlled stereo PCM looper:
 
-## Canonical Carp/Jolt song comparison
+- `guitar-audio-looper.jolt` is the main entry point.
+- `audio_looper/` contains its separated command policy, note reference, Csound
+  DSP, embedded-engine transport, voice assets, runtime adapter, setup, dashboard,
+  terminal integration, and offline checks.
+- `AUDIO_LOOPER_PLAN.md` is the main design and verification record.
+- `poc/` contains all previous experiments, including the Carp/Jolt song
+  comparison, older pitch detectors, and note-based loopers.
+- `poc/README.md` documents those historical POCs.
 
-Each canonical song source must remain self-contained, including its Csound
-orchestra. Prefer idiomatic language features rather than artificial line-for-line
-similarity.
+Do not depend on or edit the old sibling Jolt checkout. Do not add services,
+daemons, controllers, REPL/nREPL workflows, dependency manifests, build tasks,
+or a generic benchmark framework unless explicitly requested. There are no
+`bb play/stop/status/test` tasks.
 
-Carp has static types and ownership/borrowing. Keep meaningful `Chord`/`Note`
-types and collection transformations instead of flat positional data, unsafe
-indexing, or hand-written accumulator loops. Its copy/ownership APIs are not
-Clojure-style structurally shared persistent collections.
+## Main PCM looper invariants
 
-Jolt runs Clojure on Scheme, not the JVM. Keep vectors and sequence operations;
-do not assume arbitrary Java interop works. Neither canonical implementation
-uses a REPL.
+- Record and replay the actual stereo guitar PCM. Pitch is command input only;
+  never convert the recorded performance to MIDI or resynthesize it.
+- Preserve six equivalent slots, one active recorder, no overdub, and no silent
+  overwrite of an existing clip.
+- Keep command policy, note-event behavior, DSP, native transport, voice assets,
+  setup, and terminal rendering separated and independently testable.
+- Csound owns real-time work: CoreAudio, `pitchamdf`, sample clock, PCM tables,
+  playback, fades, prompts, and mixing. Jolt must not perform per-block DSP.
+- Preserve bounded sequenced host/native transport, matching operation IDs,
+  fail-closed gaps, and publication only after native acknowledgement.
+- Keep foreground ownership, Ctrl+C cleanup, terminal restoration, and the
+  independent 600-second OS wall-clock alarm.
+- `--live` is the only mode that may open an audio device. `--no-tui` intentionally
+  selects line-oriented output; omit it when checking the fixed ANSI dashboard.
+- Input selection is the only mandatory keyboard setup for FX100. The default
+  C-major guitar command profile is octave-independent.
+- Erase is a direct selected-slot command; guitar exit retains confirmation.
+- The first/master clip may trim outer silence with documented preroll/tail.
+  Later synchronized clips must preserve complete master-cycle phase.
 
-Both canonical sources generate a Csound document and send it to a foreground
-child process. Csound, not Carp/Jolt, performs the DSP. Do not claim this compares
-two audio engines. Keep the embedded orchestras identical; duplication is
-intentional so each file runs independently.
+## Previous POCs
 
-Preserve the fixed 64 BPM, amplitude 0.18, complete 32-bar form, and 120-second
-score ending: 39 roots, 217 taps, 64 kicks, 81 melody notes (401 total).
-Preserve pitch, duration, pan, the quiet guide melody (0.2 post-drive gain),
-foreground taps (2.0 post-drive gain), root vibrato, and syncopated kicks.
-Update both canonical versions together if musical behavior changes.
+Keep previous experiments under `poc/`; do not move them back to the repository
+root. Keep generated WAV/AIFF files, Carp binaries, generated `guitar-loop.csd`,
+temporary C, prompt assets, and rendered output out of git.
 
-## POC organization and behavior
+`poc/song.carp` and `poc/song.jolt` are the aligned historical language-comparison
+POC. Each remains self-contained, including its Csound orchestra. If changing
+that arrangement, preserve the fixed 64 BPM, amplitude 0.18, complete 32-bar
+form, and 120-second ending: 39 roots, 217 taps, 64 kicks, 81 melody notes (401
+total). Preserve pitch, duration, pan, guide gain 0.2, tap gain 2.0, root vibrato,
+and syncopated kicks; update both versions together.
 
-- Keep POC source paths and usage examples under `poc/`; update both root
-  `README.md` and `poc/README.md` when an entry point moves or changes.
-- Keep generated WAV/AIFF files, Carp binaries, generated `guitar-loop.csd`,
-  temporary C, and rendered output out of git. Use `/tmp` for ad-hoc verification
-  whenever possible.
-- The PCM looper must record/replay actual stereo guitar PCM. Pitch is command
-  input only; never replace the guitar with MIDI or synthesis.
-- Preserve six equivalent slots, one recorder, no overdub, bounded sequenced
-  transport, foreground ownership, Ctrl+C cleanup, and the 600-second OS alarm.
-- Keep command policy, DSP, voice assets, runtime transport, setup, and terminal
-  rendering separated and independently checkable.
-- `--no-tui` intentionally selects line-oriented output. Use live mode without
-  that flag when validating the fixed ANSI dashboard.
+Carp code should retain meaningful `Chord`/`Note` types and ownership-aware
+collection transformations. Jolt runs Clojure on Scheme, not the JVM; keep
+vectors and sequence operations and do not assume arbitrary Java interop.
 
 ## Audio safety
 
 Do not open live audio unless the user explicitly requests playback or live
-validation. Metadata enumeration and offline rendering are safe; `--live` is the
-only PCM-looper mode that may open devices.
+validation. Metadata enumeration and offline rendering are safe.
 
-Use offline rendering for canonical development:
-
-```bash
-SONG_WAV=/tmp/song-carp.wav carp -x song.carp
-jolt song.jolt /tmp/song-jolt.wav
-```
-
-Use offline checks for the PCM looper:
+Main looper offline gate:
 
 ```bash
-jolt poc/guitar-audio-looper.jolt --check
+jolt guitar-audio-looper.jolt --check
 ```
 
-Playback is foreground-only; Ctrl+C stops it. Keep both score-time endings and
-independent OS wall-clock alarms. Never introduce a daemon or leave an audio,
-Csound, `say`, or SuperCollider process running after testing.
+Historical song rendering:
+
+```bash
+SONG_WAV=/tmp/song-carp.wav carp -x poc/song.carp
+jolt poc/song.jolt /tmp/song-jolt.wav
+```
+
+Playback is foreground-only; Ctrl+C stops it. Never introduce a daemon or leave
+an audio, Csound, `say`, or SuperCollider process running after testing.
 
 For a stop request, interrupt only the foreground process group owned by the
 requested playback and verify its engine process exited before claiming silence.
@@ -89,27 +87,26 @@ unrelated audio processes.
 
 ## Verification
 
-Canonical sources:
-
-- Carp: `carp --check song.carp` and `carp -b song.carp`.
-- Jolt: `clj-kondo --cache false --lang clj --lint song.jolt`, then use
-  `cljstyle pipe` as documented in `README.md`. Do not apply Clojure tools to Carp.
-- For musical/process changes, compare score events and identical orchestras,
-  verify all 401 notes and the ending, render both without clipping, and test
-  Ctrl+C plus engine-failure propagation.
-- Allow six-significant-digit Carp rounding; never treat random pluck variation
-  as a score mismatch or require byte-identical WAVs.
-
-PCM looper and other POCs:
+For main-looper changes:
 
 - Run `clj-kondo` and `cljstyle check` on changed Jolt sources.
-- Run `jolt poc/guitar-audio-looper.jolt --check` for looper changes; this must
-  not open an audio device.
-- Compile-check `poc/audio_looper/diagnostics.c` with the pinned Csound and
-  libsndfile headers when native integration changes.
-- For process/lifecycle changes, verify signal cleanup, terminal restoration,
-  no stale owned process, and accurate nonzero failure exits.
-- Only request another user hardware pass after every relevant offline gate passes.
+- Run `jolt guitar-audio-looper.jolt --check`; it must not open an audio device.
+- Compile-check `audio_looper/diagnostics.c` with the pinned Csound and libsndfile
+  headers when native integration changes.
+- For process/lifecycle changes, verify signal cleanup, terminal restoration, no
+  stale owned process, and accurate nonzero failure exits.
+- Only request another hardware pass after all relevant offline gates pass.
+
+For the historical song POC:
+
+- Carp: `carp --check poc/song.carp` and `carp -b poc/song.carp`.
+- Jolt: `clj-kondo --cache false --lang clj --lint poc/song.jolt`, then use
+  `cljstyle pipe` as documented in `README.md`. Do not apply Clojure tools to Carp.
+- For musical/process changes, compare score events and orchestras, verify all
+  401 notes and the ending, render both without clipping, and test interruption
+  plus engine-failure propagation.
+- Allow six-significant-digit Carp rounding and random pluck variation; do not
+  require byte-identical WAVs.
 
 Use temporary files for ad-hoc checks and renders. Do not add a framework solely
 for verification.

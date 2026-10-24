@@ -1,6 +1,6 @@
 ; Fly Me to the Moon -- Bart Howard. One 32-bar chorus, 64 BPM, two minutes.
-; Play:   carp -x song.carp                 (low volume first; Ctrl+C stops)
-; Render: SONG_WAV=/tmp/song.wav carp -x song.carp    (no live audio)
+; Play:   carp -x poc/song.carp                 (low volume first; Ctrl+C stops)
+; Render: SONG_WAV=/tmp/song.wav carp -x poc/song.carp    (no live audio)
 ; Requires Carp, a C compiler, Csound and system Perl. Build files stay in temp.
 ; Notes transposed F -> C, ties merged, from:
 ; https://github.com/red-jackets-jazzband/website/blob/fa5d9123ad3ecc5a9c597967b9d15e3826beec45/static/songs/fly_me_to_the_moon.abc

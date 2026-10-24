@@ -1,8 +1,8 @@
 #!/usr/bin/env jolt
 ;; Fly Me to the Moon — Bart Howard. One 32-bar chorus, 64 BPM, two minutes.
 ;; Install: brew install jolt-lang/jolt/jolt csound
-;; Play:    jolt song.jolt            (low volume first; Ctrl+C stops)
-;; Render:  jolt song.jolt /tmp/song.wav   (no live audio)
+;; Play:    jolt poc/song.jolt            (low volume first; Ctrl+C stops)
+;; Render:  jolt poc/song.jolt /tmp/song.wav   (no live audio)
 ;; Notes transposed F -> C, ties merged, from:
 ;; https://github.com/red-jackets-jazzband/website/blob/fa5d9123ad3ecc5a9c597967b9d15e3826beec45/static/songs/fly_me_to_the_moon.abc
 
@@ -188,7 +188,7 @@ endin
 
 
 (when (> (count *command-line-args*) 1)
-  (throw (ex-info "Usage: jolt song.jolt [output.wav]" {})))
+  (throw (ex-info "Usage: jolt poc/song.jolt [output.wav]" {})))
 
 
 (let [output (first *command-line-args*)

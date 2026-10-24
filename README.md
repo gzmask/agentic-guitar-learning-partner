@@ -10,7 +10,7 @@ with MIDI or a synthesized approximation.
 
 ## Current PCM looper
 
-The entry point is [`poc/guitar-audio-looper.jolt`](poc/guitar-audio-looper.jolt).
+The entry point is [`guitar-audio-looper.jolt`](guitar-audio-looper.jolt).
 It provides:
 
 - six equivalent stereo PCM loop slots;
@@ -29,16 +29,16 @@ Run commands from the repository root:
 
 ```bash
 # Complete offline suite; does not open an audio device
-jolt poc/guitar-audio-looper.jolt --check
+jolt guitar-audio-looper.jolt --check
 
 # Inspect current CoreAudio metadata; does not open a stream
-jolt poc/guitar-audio-looper.jolt --devices
+jolt guitar-audio-looper.jolt --devices
 
 # Offline dashboard preview
-jolt poc/guitar-audio-looper.jolt
+jolt guitar-audio-looper.jolt
 
 # Live looper with the full TUI
-jolt poc/guitar-audio-looper.jolt --live
+jolt guitar-audio-looper.jolt --live
 ```
 
 `--live` is the only mode that opens audio devices. It requires a foreground
@@ -107,18 +107,18 @@ loops are normalized before the final ±0.98 limiter.
 .
 ├── README.md
 ├── AGENTS.md
-├── song.carp                  # canonical Carp arrangement
-├── song.jolt                  # canonical Jolt arrangement
+├── guitar-audio-looper.jolt  # main application entry point
+├── audio_looper/             # main policy, DSP, engine, runtime, UI, checks
+├── AUDIO_LOOPER_PLAN.md      # main design and verification record
 └── poc/
-    ├── README.md              # detailed POC commands and requirements
-    ├── AUDIO_LOOPER_PLAN.md   # PCM-looper design and verification record
-    ├── guitar-audio-looper.jolt
-    ├── audio_looper/          # policy, DSP, engine, runtime, UI, checks
-    └── ...                    # earlier detector and looper experiments
+    ├── README.md             # previous-POC commands and requirements
+    ├── song.carp             # earlier Carp/Jolt song comparison
+    ├── song.jolt
+    └── ...                   # earlier detectors and note loopers
 ```
 
-All experimental detector/looper sources live under [`poc/`](poc/README.md).
-Generated binaries, Csound documents, recordings, prompt assets, and rendered
+All previous experiments live under [`poc/`](poc/README.md). The production PCM
+looper remains at the repository root. Generated binaries, Csound documents, recordings, prompt assets, and rendered
 WAV files are ignored and must not be committed.
 
 ## Requirements
@@ -144,7 +144,7 @@ listed in [`poc/README.md`](poc/README.md).
 The PCM looper’s complete offline gate is:
 
 ```bash
-jolt poc/guitar-audio-looper.jolt --check
+jolt guitar-audio-looper.jolt --check
 ```
 
 It covers pure command policy, setup/dashboard behavior, runtime effect dispatch,
@@ -155,29 +155,29 @@ and the native `pitchamdf` lifecycle. It opens no audio device.
 Static development checks:
 
 ```bash
-cljstyle check poc/guitar-audio-looper.jolt poc/audio_looper/*.jolt
+cljstyle check guitar-audio-looper.jolt audio_looper/*.jolt
 clj-kondo --cache false --lang clj --lint \
-  poc/guitar-audio-looper.jolt poc/audio_looper/*.jolt
+  guitar-audio-looper.jolt audio_looper/*.jolt
 ```
 
-See [`poc/AUDIO_LOOPER_PLAN.md`](poc/AUDIO_LOOPER_PLAN.md) for the detailed
+See [`AUDIO_LOOPER_PLAN.md`](AUDIO_LOOPER_PLAN.md) for the detailed
 architecture, invariants, and verification record.
 
-## Canonical Carp/Jolt song comparison
+## Earlier Carp/Jolt song POC
 
-The root-level `song.carp` and `song.jolt` remain a self-contained comparison of
+`poc/song.carp` and `poc/song.jolt` remain a self-contained comparison of
 the same two-minute, 32-bar **Fly Me to the Moon** arrangement at 64 BPM. Both
 generate a Csound document; Csound performs the DSP, so this compares host-language
 data modeling and workflow rather than two audio engines.
 
 ```bash
 # Live playback
-carp -x song.carp
-jolt song.jolt
+carp -x poc/song.carp
+jolt poc/song.jolt
 
 # Offline rendering
-SONG_WAV=/tmp/song-carp.wav carp -x song.carp
-jolt song.jolt /tmp/song-jolt.wav
+SONG_WAV=/tmp/song-carp.wav carp -x poc/song.carp
+jolt poc/song.jolt /tmp/song-jolt.wav
 ```
 
 The aligned score contains 39 roots, 217 chord-tone taps, 64 kicks, and 81 melody
@@ -187,11 +187,11 @@ remain aligned.
 Minimal source checks:
 
 ```bash
-carp --check song.carp
-carp -b song.carp
-clj-kondo --cache false --lang clj --lint song.jolt
-cljstyle pipe < song.jolt > /tmp/song-formatted.jolt
-diff -u song.jolt /tmp/song-formatted.jolt
+carp --check poc/song.carp
+carp -b poc/song.carp
+clj-kondo --cache false --lang clj --lint poc/song.jolt
+cljstyle pipe < poc/song.jolt > /tmp/song-formatted.jolt
+diff -u poc/song.jolt /tmp/song-formatted.jolt
 ```
 
 Composition: Bart Howard. Melody/rhythm follows

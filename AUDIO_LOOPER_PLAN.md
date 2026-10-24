@@ -10,19 +10,19 @@ master-loop silence trimming, direct erase, TUI clarification, and mix-gain
 refinements. Entrypoints:
 
 ```bash
-jolt poc/guitar-audio-looper.jolt                 # OFFLINE UI preview; no audio stream
-jolt poc/guitar-audio-looper.jolt --no-tui        # plain preview; redirected output exits after one snapshot
-jolt poc/guitar-audio-looper.jolt --devices       # current CoreAudio metadata only
-jolt poc/guitar-audio-looper.jolt --check-control # pure control checks
-jolt poc/guitar-audio-looper.jolt --check-ui      # pure setup/renderer checks
-jolt poc/guitar-audio-looper.jolt --check-runtime # reducer/effect adapter checks
-jolt poc/guitar-audio-looper.jolt --check-engine  # production DSP/PCM/TTS checks
-jolt poc/guitar-audio-looper.jolt --check         # complete offline suite
-jolt poc/guitar-audio-looper.jolt --live          # live mode; input selection starts audio
+jolt guitar-audio-looper.jolt                 # OFFLINE UI preview; no audio stream
+jolt guitar-audio-looper.jolt --no-tui        # plain preview; redirected output exits after one snapshot
+jolt guitar-audio-looper.jolt --devices       # current CoreAudio metadata only
+jolt guitar-audio-looper.jolt --check-control # pure control checks
+jolt guitar-audio-looper.jolt --check-ui      # pure setup/renderer checks
+jolt guitar-audio-looper.jolt --check-runtime # reducer/effect adapter checks
+jolt guitar-audio-looper.jolt --check-engine  # production DSP/PCM/TTS checks
+jolt guitar-audio-looper.jolt --check         # complete offline suite
+jolt guitar-audio-looper.jolt --live          # live mode; input selection starts audio
 ```
 
-Sources: `poc/audio_looper/csound.jolt` and
-`poc/audio_looper/diagnostics.c` own native integration. In that same directory,
+Sources: `audio_looper/csound.jolt` and
+`audio_looper/diagnostics.c` own native integration. In that same directory,
 `control.jolt` and `notes.jolt` own pure policy/reference behavior;
 `dsp.jolt` and `engine.jolt` own the production Csound document and bounded
 transport; `runtime.jolt` owns reducer/effect dispatch; `voice.jolt` owns finite
@@ -158,7 +158,7 @@ tracking is used only for control commands. It must never convert the recorded
 performance into MIDI notes or resynthesize the guitar tone.
 
 The existing song comparison and detector/looper experiments remain unchanged.
-In particular, `song.carp` and `song.jolt` are out of scope.
+In particular, `poc/song.carp` and `poc/song.jolt` are out of scope.
 
 ## Goals
 

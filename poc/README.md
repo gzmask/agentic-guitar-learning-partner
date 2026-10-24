@@ -1,10 +1,29 @@
-# Guitar and audio POCs
+# Previous guitar and audio POCs
 
-This directory contains every experimental guitar-input detector, pitch
-comparison, and looper. The canonical Carp/Jolt song sources remain at the
-repository root. Commands below run from the repository root unless a block
-explicitly changes into `poc/`. Live commands open audio devices; use low
-volume/headphones and stop with Ctrl+C.
+This directory contains the experiments that preceded the production PCM looper.
+The main application is [`../guitar-audio-looper.jolt`](../guitar-audio-looper.jolt),
+with its modules and documentation at the repository root. Commands below run
+from the repository root unless a block explicitly changes into `poc/`. Live
+commands open audio devices; use low volume/headphones and stop with Ctrl+C.
+
+## Carp/Jolt song comparison
+
+`poc/song.carp` and `poc/song.jolt` implement the same two-minute, 32-bar
+**Fly Me to the Moon** arrangement as a host-language comparison. Both generate
+Csound documents; they compare Carp/Jolt data modeling and workflow, not audio
+engines.
+
+```bash
+carp --check poc/song.carp
+carp -b poc/song.carp
+clj-kondo --cache false --lang clj --lint poc/song.jolt
+
+SONG_WAV=/tmp/song-carp.wav carp -x poc/song.carp
+jolt poc/song.jolt /tmp/song-jolt.wav
+```
+
+The aligned score contains 39 roots, 217 chord-tone taps, 64 kicks, and 81 melody
+notes: 401 events total.
 
 ## FX100 pitch detector (separate experiment)
 
@@ -93,7 +112,7 @@ language runtime/toolchain.
 **detected notes, not audio**, for the first 60 seconds, while passing the live
 stereo guitar through at -6 dB. At 60 seconds it stops detection and starts
 looping that phrase with the pluck/overdrive/sustain/vibrato guitar tone from
-`song.carp`. New playing stays **raw stereo audio** throughout: it is not
+`poc/song.carp`. New playing stays **raw stereo audio** throughout: it is not
 converted to synth notes or added to the recording. The live input and recorded
 synth loop are mixed together. Synth voices have 150 ms of additional ringing
 time and do not cut each other off.
@@ -211,97 +230,6 @@ threshold 0.93, N=2048, k=1024, overlap=1024; confidence must exceed 0.9. Loop
 notes are sent back to SuperCollider as timestamped synth events, while new
 guitar playing remains raw and is never overdubbed. Use low volume/headphones,
 avoid direct-monitor doubling, and press Ctrl+C to stop.
-
-## PCM audio looper — hardware-tested POC
-
-[`AUDIO_LOOPER_PLAN.md`](AUDIO_LOOPER_PLAN.md) describes the six-slot looper that
-records the actual stereo waveform and uses pitch only for commands. **Stages
-0–6 are implemented and pass the offline suite.** Multiple real FX100 hardware
-passes validated setup, guitar commands, PCM record/playback, and the TUI, then
-drove octave, silence-trim, erase-flow, and gain refinements. The existing
-note loopers and songs are unchanged.
-
-```bash
-jolt poc/guitar-audio-looper.jolt                 # OFFLINE UI preview; no audio stream
-jolt poc/guitar-audio-looper.jolt --no-tui        # same preview, plain output
-jolt poc/guitar-audio-looper.jolt --devices       # current CoreAudio metadata only
-jolt poc/guitar-audio-looper.jolt --check-control # pure reducer checks
-jolt poc/guitar-audio-looper.jolt --check-ui      # pure setup/renderer checks
-jolt poc/guitar-audio-looper.jolt --check-runtime # reducer/effect adapter checks
-jolt poc/guitar-audio-looper.jolt --check-engine  # production DSP/PCM/TTS checks
-jolt poc/guitar-audio-looper.jolt --check         # complete offline suite
-jolt poc/guitar-audio-looper.jolt --live          # live mode; input selection starts audio
-```
-
-The default command remains an **offline preview**, not a silent launch of live
-audio. On a terminal it offers the current input list and then uses the default
-C-major profile immediately; every later looper command comes from the guitar. `[d]` toggles pitch debug, `[c]` reopens configuration only
-when the session is empty/idle, and `[q]` quits. Ctrl+D, Ctrl+C, SIGTERM, and
-handled errors restore terminal configuration and the cursor/alternate screen.
-Redirected preview prints one plain snapshot and exits; `--no-tui` never emits
-ANSI and logs only semantic state transitions unless pitch debug is enabled.
-Because `--no-tui` explicitly selects line mode, use `--live` without that flag
-for the full fixed ANSI dashboard.
-
-Only `--live` can open audio. It requires a foreground TTY and fresh UID-based
-device resolution. Selecting the input is the only mandatory keyboard setup;
-that selection starts finite prompt preparation and then opens the engine, with
-a low-volume/headphone warning but no redundant `LIVE` text confirmation. An
-multiple FX100 hardware passes completed end-to-end record/playback and drove
-iterative control, trimming, TUI, and mix improvements.
-
-Device enumeration reads CoreAudio metadata without opening a stream. Selection
-retains stable CoreAudio UIDs and re-resolves volatile `adcN`/`dacN` identifiers;
-an unplugged or ambiguous device is rejected. FX100 is treated as guitar/line
-input. Other inputs require explicit headphone confirmation and default to
-software monitoring off.
-
-`poc/audio_looper/control.jolt` is the pure `(step state event) => [state effects]`
-policy. `runtime.jolt` is the 100 Hz host adapter. `dsp.jolt` and `engine.jolt`
-own the production Csound document and bounded transport. Csound performs all
-real-time work: `pitchamdf`, gating, the sample clock, six stereo PCM buffers,
-one recorder, six players, cycle-boundary scheduling, crossfades, prompt audio,
-and output mixing. Wake, selector, action, and exit-confirmation notes
-match their configured scale degree in any supported octave; parser phase keeps
-the meanings unambiguous. Jolt does no per-block DSP, and recorded guitar is
-never converted to MIDI or resynthesized.
-
-The native engine uses a sequenced host mailbox and a 128-entry committed event
-ring. Pending reducer effects become clips/playback only after matching native
-acknowledgements. Tests cover arbitrary sample boundaries, command trimming,
-5 ms seams, 10 ms start/stop ramps, six concurrent slots, isolated erase,
-maximum-length freezing, event gaps/duplicates, clipping headroom, and every
-recorded stereo sample against its source. The first/master clip also removes
-outer silence from bounded 10 ms RMS summaries at -50 dBFS while retaining 20 ms
-preroll and 50 ms tail. Later clips preserve complete master cycles so trimming
-cannot destroy synchronization. A single loop plays at 0.65 gain while the raw
-software monitor uses 0.30, a roughly 9 dB loop-to-live relative increase over
-the first hardware-tested mix; simultaneous loops are normalized before the
-final limiter.
-
-Finite spoken prompts are generated by owned `/usr/bin/say` children before the
-audio stream opens, validated as 44.1 kHz mono float32 WAV, copied into Csound
-tables, and deleted at shutdown. Csound—not `say`—plays them. The finite
-94-prompt cache is generated before audio opens; startup remains inside the independent 600-second OS limit.
-
-The POC pins **Jolt v0.8.10, Csound 6.18/API 4.00, double MYFLT**.
-`poc/audio_looper/csound.jolt` owns all FFI bindings. The bounded
-`poc/audio_looper/diagnostics.c` bridge latches engine errors and bulk-loads validated
-prompt WAVs through libsndfile. Apple command line tools compile it into a
-temporary dylib linked to the same Csound framework and Homebrew libsndfile.
-Set `CSOUND_LIBRARY` or `SNDFILE_PREFIX` for nonstandard installations.
-
-`--check` opens no audio devices. It runs pure policy/UI/runtime checks plus the
-actual production orchestra offline: stereo PCM preservation, six slots,
-capacity, prompt/cue completion and cancellation, and native detector lifecycle
-against the pure reference. Separate process checks cover SIGINT/SIGTERM cleanup,
-the OS alarm, incompatible ABI rejection, and engine failures. A full offline
-startup with the complete prompt set and maximum six-slot capacity also completes
-without clipping or a lingering process.
-
-The installed engine stores tables as float64. A 120-second stereo slot requires
-about **80.75 MiB**, or **484.5 MiB** for six before engine overhead. Float32 is
-only the temporary prompt/offline WAV representation.
 
 ## Same-recording pitch comparison
 
