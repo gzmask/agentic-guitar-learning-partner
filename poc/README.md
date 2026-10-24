@@ -6,31 +6,12 @@ with its modules and documentation at the repository root. Commands below run
 from the repository root unless a block explicitly changes into `poc/`. Live
 commands open audio devices; use low volume/headphones and stop with Ctrl+C.
 
-## Carp/Jolt song comparison
-
-`poc/song.carp` and `poc/song.jolt` implement the same two-minute, 32-bar
-**Fly Me to the Moon** arrangement as a host-language comparison. Both generate
-Csound documents; they compare Carp/Jolt data modeling and workflow, not audio
-engines.
-
-```bash
-carp --check poc/song.carp
-carp -b poc/song.carp
-clj-kondo --cache false --lang clj --lint poc/song.jolt
-
-SONG_WAV=/tmp/song-carp.wav carp -x poc/song.carp
-jolt poc/song.jolt /tmp/song-jolt.wav
-```
-
-The aligned score contains 39 roots, 217 chord-tone taps, 64 kicks, and 81 melody
-notes: 401 events total.
-
 ## FX100 pitch detector (separate experiment)
 
 `poc/guitar-to-midi.jolt` reads the FX100 USB audio input and prints detected MIDI
 note numbers, note names/octaves (C4 = MIDI 60), frequency, and level. It tracks
 one note at a time; it does not yet send MIDI messages or synthesize a MIDI voice.
-The two song implementations above are unchanged.
+This detector is independent of the other POCs.
 
 ```bash
 jolt poc/guitar-to-midi.jolt                 # console detection, silent output
@@ -111,8 +92,7 @@ language runtime/toolchain.
 `poc/guitar-looper.carp` is a separate, self-contained experiment. It records
 **detected notes, not audio**, for the first 60 seconds, while passing the live
 stereo guitar through at -6 dB. At 60 seconds it stops detection and starts
-looping that phrase with the pluck/overdrive/sustain/vibrato guitar tone from
-`poc/song.carp`. New playing stays **raw stereo audio** throughout: it is not
+looping that phrase with the earlier pluck/overdrive/sustain/vibrato guitar tone. New playing stays **raw stereo audio** throughout: it is not
 converted to synth notes or added to the recording. The live input and recorded
 synth loop are mixed together. Synth voices have 150 ms of additional ringing
 time and do not cut each other off.

@@ -112,9 +112,7 @@ loops are normalized before the final ±0.98 limiter.
 ├── AUDIO_LOOPER_PLAN.md      # main design and verification record
 └── poc/
     ├── README.md             # previous-POC commands and requirements
-    ├── song.carp             # earlier Carp/Jolt song comparison
-    ├── song.jolt
-    └── ...                   # earlier detectors and note loopers
+    └── ...                   # earlier songs, detectors, and note loopers
 ```
 
 All previous experiments live under [`poc/`](poc/README.md). The production PCM
@@ -135,7 +133,7 @@ Apple command-line tools provide `/usr/bin/cc`; macOS `/usr/bin/say` generates
 temporary prompt assets. Set `CSOUND_LIBRARY` or `SNDFILE_PREFIX` when those
 libraries are installed outside the standard Homebrew/framework locations.
 
-Carp is needed only for the Carp song and Carp POCs. JVM Clojure, Overtone,
+Carp is needed only for Carp-based POCs. JVM Clojure, Overtone,
 SuperCollider, and sc3-plugins are needed only for the corresponding older POCs
 listed in [`poc/README.md`](poc/README.md).
 
@@ -162,38 +160,3 @@ clj-kondo --cache false --lang clj --lint \
 
 See [`AUDIO_LOOPER_PLAN.md`](AUDIO_LOOPER_PLAN.md) for the detailed
 architecture, invariants, and verification record.
-
-## Earlier Carp/Jolt song POC
-
-`poc/song.carp` and `poc/song.jolt` remain a self-contained comparison of
-the same two-minute, 32-bar **Fly Me to the Moon** arrangement at 64 BPM. Both
-generate a Csound document; Csound performs the DSP, so this compares host-language
-data modeling and workflow rather than two audio engines.
-
-```bash
-# Live playback
-carp -x poc/song.carp
-jolt poc/song.jolt
-
-# Offline rendering
-SONG_WAV=/tmp/song-carp.wav carp -x poc/song.carp
-jolt poc/song.jolt /tmp/song-jolt.wav
-```
-
-The aligned score contains 39 roots, 217 chord-tone taps, 64 kicks, and 81 melody
-notes: 401 events total. The two embedded orchestras and musical behavior should
-remain aligned.
-
-Minimal source checks:
-
-```bash
-carp --check poc/song.carp
-carp -b poc/song.carp
-clj-kondo --cache false --lang clj --lint poc/song.jolt
-cljstyle pipe < poc/song.jolt > /tmp/song-formatted.jolt
-diff -u poc/song.jolt /tmp/song-formatted.jolt
-```
-
-Composition: Bart Howard. Melody/rhythm follows
-[this lead-sheet reference](https://github.com/red-jackets-jazzband/website/blob/fa5d9123ad3ecc5a9c597967b9d15e3826beec45/static/songs/fly_me_to_the_moon.abc),
-transposed from F to C with ties merged.

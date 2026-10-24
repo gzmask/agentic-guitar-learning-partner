@@ -157,8 +157,7 @@ The new looper records and replays the guitar's **stereo PCM waveform**. Pitch
 tracking is used only for control commands. It must never convert the recorded
 performance into MIDI notes or resynthesize the guitar tone.
 
-The existing song comparison and detector/looper experiments remain unchanged.
-In particular, `poc/song.carp` and `poc/song.jolt` are out of scope.
+Previous experiments under `poc/` are out of scope.
 
 ## Goals
 
