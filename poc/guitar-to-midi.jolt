@@ -1,8 +1,8 @@
 #!/usr/bin/env jolt
 ;; Monophonic guitar pitch detector for a FLAMMA FX100 connected over USB.
-;; Run:     jolt guitar-to-midi.jolt
-;; Monitor: jolt guitar-to-midi.jolt --monitor    (low volume/headphones first)
-;; Check:   jolt guitar-to-midi.jolt --check
+;; Run:     jolt poc/guitar-to-midi.jolt
+;; Monitor: jolt poc/guitar-to-midi.jolt --monitor    (low volume/headphones first)
+;; Check:   jolt poc/guitar-to-midi.jolt --check
 ;; The current FX100 CoreAudio mapping is adc2/dac4; pass replacements as args.
 
 (require '[clojure.java.shell :refer [sh]])
@@ -102,7 +102,7 @@ endin
 
 
 (def usage
-  "Usage: jolt guitar-to-midi.jolt [--monitor] [adcN dacN]\n       jolt guitar-to-midi.jolt --check [--monitor]")
+  "Usage: jolt poc/guitar-to-midi.jolt [--monitor] [adcN dacN]\n       jolt poc/guitar-to-midi.jolt --check [--monitor]")
 
 
 (defn parse-options

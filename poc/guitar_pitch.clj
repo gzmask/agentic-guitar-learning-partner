@@ -1,5 +1,5 @@
 ;; JVM Clojure + Overtone / SuperCollider Pitch.kr, separate from the song POC.
-;; clojure -Sdeps '{:deps {overtone/overtone {:mvn/version "0.16.3331"}}}' -M guitar_pitch.clj [--monitor]
+;; clojure -Sdeps '{:deps {overtone/overtone {:mvn/version "0.16.3331"}}}' -M poc/guitar_pitch.clj [--monitor]
 ;; --check compiles the graph without opening audio or starting scsynth.
 ;; --compare recording.wav compares four trackers offline; requires ffmpeg + csound
 ;; and the sc3-plugins PitchDetection extension.
@@ -53,9 +53,9 @@
 
 
 (def usage
-  (str "Usage: ... -M guitar_pitch.clj [--monitor] [--raw] [--seconds 1..600]\n"
+  (str "Usage: ... -M poc/guitar_pitch.clj [--monitor] [--raw] [--seconds 1..600]\n"
        "       [--input DEVICE] [--output DEVICE] [--check | --help]\n"
-       "       ... -M guitar_pitch.clj --compare recording.wav [--raw]\n"
+       "       ... -M poc/guitar_pitch.clj --compare recording.wav [--raw]\n"
        "Live defaults: Fx100 input/output, 60 seconds, silent output.\n"
        "Comparison: same recording/RMS/filter; no live audio; ffmpeg + csound required.\n"
        "SCSYNTH may override the scsynth executable path."))

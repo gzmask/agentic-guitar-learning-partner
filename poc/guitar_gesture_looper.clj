@@ -88,7 +88,7 @@
 
 (def usage
   (str "Usage: clojure -Sdeps '{:deps {overtone/overtone "
-       "{:mvn/version \"0.16.3331\"}}}' -M guitar_gesture_looper.clj\n"
+       "{:mvn/version \"0.16.3331\"}}}' -M poc/guitar_gesture_looper.clj\n"
        "       [--input DEVICE] [--output DEVICE] [--gate=-44] [--check | --help]\n"
        "Defaults: Fx100 input/output, raw stereo monitor -6 dB, gate -44/-50 dBFS.\n"
        "Device values are SuperCollider/CoreAudio names, not Csound adcN/dacN IDs."))

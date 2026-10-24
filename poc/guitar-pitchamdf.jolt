@@ -1,6 +1,6 @@
 #!/usr/bin/env jolt
 ;; Monophonic FX100 pitch tracking using Csound AMDF (not ptrack).
-;; jolt guitar-pitchamdf.jolt --monitor adc2 dac5
+;; jolt poc/guitar-pitchamdf.jolt --monitor adc2 dac5
 ;; Add --raw for 10 Hz estimates, or --gate=-48 for a quieter input.
 ;; --check opens no audio devices. Ctrl+C stops; safety limit is 600 seconds.
 
@@ -108,8 +108,8 @@ endin
 
 
 (def usage
-  (str "Usage: jolt guitar-pitchamdf.jolt [--monitor] [--raw] [--gate=-44] [adcN dacN]\n"
-       "       jolt guitar-pitchamdf.jolt --check\n"
+  (str "Usage: jolt poc/guitar-pitchamdf.jolt [--monitor] [--raw] [--gate=-44] [adcN dacN]\n"
+       "       jolt poc/guitar-pitchamdf.jolt --check\n"
        "Default: adc2/dac4, silent output, RMS gate -44/-50 dBFS."))
 
 

@@ -1,5 +1,5 @@
 ; Monophonic FX100 pitch tracking using Csound AMDF (not ptrack).
-; Build: carp -b guitar-pitchamdf.carp
+; Build: carp -b poc/guitar-pitchamdf.carp
 ; Run: "${TMPDIR:-/tmp}/carp-guitar-pitchamdf/guitar-pitchamdf" --monitor adc2 dac5
 ; Add --raw for 10 Hz estimates, or --gate=-48 for a quieter input.
 ; --check opens no audio devices. Ctrl+C stops; safety limit is 600 seconds.
@@ -12,7 +12,7 @@
 
 (deftype Options [check Bool monitor Bool raw Bool gate Double input String output String])
 
-; Kept identical to guitar-pitchamdf.jolt; Csound does the pitch detection.
+; Kept identical to poc/guitar-pitchamdf.jolt; Csound does the pitch detection.
 (defn orchestra []
   (String.copy "sr = 44100
 ksmps = 32

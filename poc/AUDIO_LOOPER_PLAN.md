@@ -3,26 +3,27 @@
 ## Status
 
 This document is the design and verification record for the looper POC.
-Implementation covers **stages 0–6** and passes the complete offline suite. The
-explicit live path is connected and completed an initial real FX100/guitar pass.
-That pass exposed octave ergonomics and outer-silence issues; the resulting
-pitch-class and master-trim changes pass offline gates and now need a short
-follow-up hardware validation. Entrypoints:
+Implementation covers **stages 0–6**, passes the complete offline suite, and has
+completed multiple real FX100/guitar validation passes. Those passes validated
+end-to-end PCM recording/playback and drove octave-independent commands,
+master-loop silence trimming, direct erase, TUI clarification, and mix-gain
+refinements. Entrypoints:
 
 ```bash
-jolt guitar-audio-looper.jolt                 # OFFLINE UI preview; no audio stream
-jolt guitar-audio-looper.jolt --no-tui        # plain preview; redirected output exits after one snapshot
-jolt guitar-audio-looper.jolt --devices       # current CoreAudio metadata only
-jolt guitar-audio-looper.jolt --check-control # pure control checks
-jolt guitar-audio-looper.jolt --check-ui      # pure setup/renderer checks
-jolt guitar-audio-looper.jolt --check-runtime # reducer/effect adapter checks
-jolt guitar-audio-looper.jolt --check-engine  # production DSP/PCM/TTS checks
-jolt guitar-audio-looper.jolt --check         # complete offline suite
-jolt guitar-audio-looper.jolt --live          # live mode; input selection starts audio
+jolt poc/guitar-audio-looper.jolt                 # OFFLINE UI preview; no audio stream
+jolt poc/guitar-audio-looper.jolt --no-tui        # plain preview; redirected output exits after one snapshot
+jolt poc/guitar-audio-looper.jolt --devices       # current CoreAudio metadata only
+jolt poc/guitar-audio-looper.jolt --check-control # pure control checks
+jolt poc/guitar-audio-looper.jolt --check-ui      # pure setup/renderer checks
+jolt poc/guitar-audio-looper.jolt --check-runtime # reducer/effect adapter checks
+jolt poc/guitar-audio-looper.jolt --check-engine  # production DSP/PCM/TTS checks
+jolt poc/guitar-audio-looper.jolt --check         # complete offline suite
+jolt poc/guitar-audio-looper.jolt --live          # live mode; input selection starts audio
 ```
 
-Sources: `audio_looper/csound.jolt` and `audio_looper/diagnostics.c` own native
-integration; `control.jolt` and `notes.jolt` own pure policy/reference behavior;
+Sources: `poc/audio_looper/csound.jolt` and
+`poc/audio_looper/diagnostics.c` own native integration. In that same directory,
+`control.jolt` and `notes.jolt` own pure policy/reference behavior;
 `dsp.jolt` and `engine.jolt` own the production Csound document and bounded
 transport; `runtime.jolt` owns reducer/effect dispatch; `voice.jolt` owns finite
 temporary prompt assets; `setup.jolt`, `dashboard.jolt`, and `terminal.jolt`
@@ -1022,7 +1023,7 @@ Only when the user requests and is ready to play:
    - Confirmed guitar exit.
    - Ctrl+C and engine-failure cleanup.
 
-7. **Live validation — initial pass complete; follow-up retest pending**
+7. **Live validation — multiple FX100 passes complete**
    - Performed only with explicit user participation and low-volume/headphone
      precautions.
 
@@ -1035,7 +1036,7 @@ error handling. Csound 6.18 is embedded through `jolt.ffi` and owns CoreAudio,
 and mixing.
 
 Borrow the host-owned pure-state architecture demonstrated by
-`guitar_gesture_looper.clj`, not its JVM, Overtone, SuperCollider, OSC, or
+`poc/guitar_gesture_looper.clj`, not its JVM, Overtone, SuperCollider, OSC, or
 Tartini dependencies. Do not copy the current Jolt scripts' blocking `sh`
 launcher or move the expanded command state machine into Csound orchestra code.
 

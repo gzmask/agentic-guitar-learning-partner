@@ -1,7 +1,7 @@
 #!/usr/bin/env jolt
 ;; Guitar-controlled note looper. Csound performs detection, control and DSP.
-;; jolt guitar-gesture-looper.jolt adc2 dac5       (low volume/headphones first)
-;; jolt guitar-gesture-looper.jolt --check        (no audio devices)
+;; jolt poc/guitar-gesture-looper.jolt adc2 dac5       (low volume/headphones first)
+;; jolt poc/guitar-gesture-looper.jolt --check        (no audio devices)
 ;; C5 D5 C5 D5: start recording. D5 C5 D5 C5: finish, loop; repeat to exit.
 ;; C4 = MIDI 60, so C5/D5 = MIDI 72/74. Four confirmed notes within four seconds.
 ;; Live guitar always passes through at -6 dB; only the captured take is synthesized.
@@ -209,8 +209,8 @@ endin
 
 
 (def usage
-  (str "Usage: jolt guitar-gesture-looper.jolt [--gate=-44] [adcN dacN]\n"
-       "       jolt guitar-gesture-looper.jolt --check\n"
+  (str "Usage: jolt poc/guitar-gesture-looper.jolt [--gate=-44] [adcN dacN]\n"
+       "       jolt poc/guitar-gesture-looper.jolt --check\n"
        "Default adc2/dac5, raw stereo monitor -6 dB, RMS gate -44/-50 dBFS."))
 
 

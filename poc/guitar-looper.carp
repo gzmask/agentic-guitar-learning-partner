@@ -1,4 +1,5 @@
 ; Record 60 seconds of pitchamdf notes, then loop synthesized guitar + live input.
+; Run these commands from poc/ so generated artifacts stay with the POC.
 ; Build: carp -b guitar-looper.carp          (binary: ./guitar-looper)
 ; Run:   ./guitar-looper adc2 dac5           (FX100 -> Mac speakers; low volume)
 ; Check: ./guitar-looper --check            (no audio devices or recording files)
